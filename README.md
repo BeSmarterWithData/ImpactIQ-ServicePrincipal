@@ -4,7 +4,7 @@
 <em><strong>Be smarter with every change </strong></em>
     <br/>
   <br/>
-  <em>Service Principal Version - Designed for Unattended Execution</em>
+  <em>Service Principal Edition - Designed for Unattended Execution</em>
 </p>
 
 # Impact Analysis and Governance for Power BI + Fabric
