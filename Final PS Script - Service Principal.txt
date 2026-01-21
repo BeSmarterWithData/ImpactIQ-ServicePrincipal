@@ -34,7 +34,64 @@ $AppSecret = "YOUR_APP_SECRET"      # Your Service Principal Client Secret
 
 # Validate service principal configuration
 if ($TenantId -eq "YOUR_TENANT_ID" -or $AppId -eq "YOUR_APP_ID" -or $AppSecret -eq "YOUR_APP_SECRET") {
-    Write-Error "Please configure the service principal credentials (TenantId, AppId, AppSecret) at the top of this script before running."
+    # Show a Windows Form popup with clear instructions
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+    
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = "Service Principal Configuration Required"
+    $form.Size = New-Object System.Drawing.Size(600, 350)
+    $form.StartPosition = "CenterScreen"
+    $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
+    $form.MaximizeBox = $false
+    $form.MinimizeBox = $false
+    $form.TopMost = $true
+    $form.Icon = [System.Drawing.SystemIcons]::Warning
+    
+    # Title Label
+    $titleLabel = New-Object System.Windows.Forms.Label
+    $titleLabel.Location = New-Object System.Drawing.Point(20, 20)
+    $titleLabel.Size = New-Object System.Drawing.Size(550, 30)
+    $titleLabel.Font = New-Object System.Drawing.Font("Segoe UI", 14, [System.Drawing.FontStyle]::Bold)
+    $titleLabel.Text = "⚠️  Service Principal Credentials Not Configured"
+    $titleLabel.ForeColor = [System.Drawing.Color]::DarkRed
+    $form.Controls.Add($titleLabel)
+    
+    # Message Label
+    $messageLabel = New-Object System.Windows.Forms.Label
+    $messageLabel.Location = New-Object System.Drawing.Point(20, 60)
+    $messageLabel.Size = New-Object System.Drawing.Size(550, 140)
+    $messageLabel.Font = New-Object System.Drawing.Font("Segoe UI", 10)
+    $messageLabel.Text = @"
+This script requires Service Principal credentials to run.
+
+Please update the following values at the TOP of this script file:
+(Lines 31-33 in "Final PS Script - Service Principal.txt")
+
+   • `$TenantId    - Your Azure AD Tenant ID
+   • `$AppId       - Your Service Principal Application (Client) ID
+   • `$AppSecret   - Your Service Principal Client Secret
+
+For detailed setup instructions, please refer to the README.md file.
+
+The script will now exit. Please configure the credentials and run again.
+"@
+    $form.Controls.Add($messageLabel)
+    
+    # OK Button
+    $okButton = New-Object System.Windows.Forms.Button
+    $okButton.Location = New-Object System.Drawing.Point(250, 260)
+    $okButton.Size = New-Object System.Drawing.Size(100, 35)
+    $okButton.Text = "OK"
+    $okButton.Font = New-Object System.Drawing.Font("Segoe UI", 10)
+    $okButton.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    $form.Controls.Add($okButton)
+    $form.AcceptButton = $okButton
+    
+    # Show the form
+    $result = $form.ShowDialog()
+    
+    # Exit after user clicks OK
     exit
 }
 
