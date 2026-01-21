@@ -4,17 +4,20 @@
 <em><strong>Be smarter with every change </strong></em>
     <br/>
   <br/>
-  <em>One-Click, Designed for Everyone</em>
+  <em>Service Principal Version - Designed for Unattended Execution</em>
 </p>
 
 # Impact Analysis and Governance for Power BI + Fabric
 
-### This all-in-one solution is designed to be ran by ANYONE. 
-- Everything within the script is limited to your access within the Power BI and/or Fabric environment.
+### This Service Principal version is designed for automated and scheduled execution. 
+- Uses Service Principal authentication instead of interactive login for unattended operation.
+- Perfect for scheduled tasks, automation workflows, and CI/CD pipelines.
+- Everything within the script is limited to the Service Principal's access within the Power BI and/or Fabric environment.
 - All computer requirements are at the user level and do not require admin privileges.
-- There are ZERO pre-reqs. The one-click solution stays updated with the latest features.
   
-*Have specific Reports and/or Models downloaded you want to analyze? Don't have direct access to the Workspace but have the PBIX? Check out Impact IQ's local edition here: https://github.com/BeSmarterWithData/ImpactIQ-Local*
+*Looking for the interactive user version with one-click setup? Check out the main Impact IQ repository: https://github.com/BeSmarterWithData/ImpactIQ*
+
+*Have specific Reports and/or Models downloaded you want to analyze? Check out Impact IQ's local edition here: https://github.com/BeSmarterWithData/ImpactIQ-Local*
 
 ## What It Does
 This provides a quick and automated way to identify where and how specific fields, measures, and tables are used across Power BI reports in all workspaces down to the visual level. It also backs up and breaks down the details of your models, reports, and dataflows for easy review, giving you an all-in-one **Power BI & Fabric Governance** solution.
@@ -38,35 +41,38 @@ a popup will allow you to choose which workspaces you run this against. Select A
 - **Report-Level Measures Inventory** → Surface report-only measures with full DAX and usage details.
 - **New Report Layouts & Wireframe** → See where your visuals sit on the page with a wireframe layout - thanks to @stephbruno for this feature!
   
- ---
+---
 
 ## 🚀 Quick Start Instructions  
 
-You’ve got **two ways** to get started:  
+### Prerequisites
 
+Before running this Service Principal version, you need to:
 
-### 🟢 Option 1 — One-Click Update & Run Tool (Recommended)  
-Always up-to-date and the easiest way to get started.  
+1. **Create an Azure AD App Registration** (Service Principal)
+   - Go to Azure Portal → Azure Active Directory → App registrations → New registration
+   - Note down the **Tenant ID** and **Application (Client) ID**
+   - Create a **Client Secret** under Certificates & secrets
 
-➡️ [**Download Impact IQ - One-Click Update & Run Tool**](https://github.com/BeSmarterWithData/ImpactIQ/releases/download/v2.0/ImpactIQ.bat)
+2. **Grant Power BI Permissions**
+   - Add the Service Principal to a **Security Group** in Azure AD
+   - In Power BI Admin Portal → Tenant settings:
+     - Enable "Allow service principals to use Power BI APIs"
+     - Add your security group to this setting
+   - Grant the Service Principal appropriate workspace access (Admin, Member, or Contributor roles)
 
-This automatically:  
-1. Pulls the latest repo from GitHub
-2. Places it into `C:\Power BI Backups`
-3. Runs the **Final PS Script**  
-4. Opens the **Power BI Governance Model** at the end  
-
-> 💡 **Tip:** Once downloaded, simply re-run this locally anytime to keep your **backups** and **governance details up-to-date** *and* take advantage of the **newest features**.  
-
-> ⚠️ If security policies block the batch file, follow the manual steps below instead.
-
-
-📂 **All backups and the final Power BI Governance Model will be saved to:** `C:\Power BI Backups`
-
+3. **Configure the Script**
+   - Open `Final PS Script - Service Principal.txt`
+   - Replace the placeholder values at the top:
+     ```powershell
+     $TenantId = "YOUR_TENANT_ID"        # Your Azure AD Tenant ID
+     $AppId = "YOUR_APP_ID"              # Your Service Principal Application (Client) ID  
+     $AppSecret = "YOUR_APP_SECRET"      # Your Service Principal Client Secret
+     ```
 
 ---
 
-### 🟡 Option 2 — Manual Setup  
+### Setup & Execution Steps
 
 #### ✅ Step 1: Create Folder  
 > Make a folder at:  `C:\Power BI Backups`  
@@ -74,34 +80,55 @@ This automatically:
 #### ✅ Step 2: Add Files  
 > Download all repo files and place them into the newly-created `C:\Power BI Backups` folder.  
 
-#### ✅ Step 3: Run Script  
-> Open PowerShell and run the Final PS Script. You can:  
-> - Copy/paste the full script, or  
-> - Rename `Final PS Script.txt` → `Final PS Script.ps1` and run directly  
+#### ✅ Step 3: Configure Service Principal Credentials
+> Open `Final PS Script - Service Principal.txt` in a text editor and update the three credential values at the top:
+> - `$TenantId` - Your Azure AD Tenant ID
+> - `$AppId` - Your Service Principal Application (Client) ID
+> - `$AppSecret` - Your Service Principal Client Secret
+>
+> **Important:** Save these credentials securely in the script file. The script will validate these values before running.
+
+#### ✅ Step 4: Run Script  
+> Open PowerShell and run the Final PS Script - Service Principal. You can:  
+> - Copy/paste the full script content into PowerShell, or  
+> - Rename `Final PS Script - Service Principal.txt` → `Final PS Script - Service Principal.ps1` and run directly  
 > 
 > **Environment Selection**: When prompted, choose your Power BI environment:
 > - Press **Enter** for Public cloud (default)
 > - Or choose: `Germany`, `USGov`, `China`, `USGovHigh`, or `USGovMil` for sovereign clouds.
 > - If no selection is made after 120 seconds, it will continue with the default of Public.
+>
+> **Note:** Unlike the interactive version, this script uses Service Principal authentication and does not require interactive login. It runs completely unattended once configured.
 
-#### ✅ Step 4: Open the Power BI File  
+#### ✅ Step 5: Open the Power BI File  
 > Open: `Power BI Governance Model.pbit`  
 > → Let it refresh, then save as `.pbix`  
 
----
+#### ✅ Step 6: Schedule (Optional)
+> Once configured, you can schedule this script to run automatically using:
+> - Windows Task Scheduler
+> - Azure Automation
+> - Azure DevOps Pipelines
+> - Any other automation platform that can run PowerShell scripts
 
-🎉 That’s it — enjoy! 🎉
-
-
-
-
-
-
-
+📂 **All backups and the final Power BI Governance Model will be saved to:** `C:\Power BI Backups`
 
 ---
+
+🎉 That's it — enjoy! 🎉
+
 
 ### ℹ️ Additional Notes
+
+> 🔐 **Service Principal Authentication**  
+> This version uses Azure AD Service Principal (App Registration) authentication for unattended execution:
+> - **No interactive login required** - Credentials are configured directly in the script
+> - **Perfect for automation** - Can be scheduled to run automatically via Task Scheduler, Azure Automation, or CI/CD pipelines
+> - **Secure credential management** - Client secrets should be stored securely (consider using Azure Key Vault for production scenarios)
+> - **Requires Power BI Admin setup** - Service Principals must be enabled in Power BI tenant settings and granted appropriate workspace permissions
+> - **Same outputs as interactive version** - All features and functionality are identical, only the authentication method differs
+>
+> For the interactive user version with one-click setup, see: https://github.com/BeSmarterWithData/ImpactIQ
 
 > 🌐 **Sovereign Cloud Support**  
 > The script now supports Power BI in Government and International cloud environments:
