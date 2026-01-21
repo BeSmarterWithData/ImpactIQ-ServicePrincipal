@@ -63,12 +63,14 @@ Before running this Service Principal version, you need to:
 
 3. **Configure the Script**
    - Open `Final PS Script - Service Principal.txt`
-   - Replace the placeholder values at the top:
+   - Update the credential placeholders at the top of the file:
      ```powershell
      $TenantId = "YOUR_TENANT_ID"        # Your Azure AD Tenant ID
      $AppId = "YOUR_APP_ID"              # Your Service Principal Application (Client) ID  
      $AppSecret = "YOUR_APP_SECRET"      # Your Service Principal Client Secret
      ```
+   - **For development/testing:** You can store credentials directly in the script file
+   - **For production:** Use secure credential storage (Azure Key Vault, environment variables, etc.)
 
 ---
 
@@ -86,7 +88,10 @@ Before running this Service Principal version, you need to:
 > - `$AppId` - Your Service Principal Application (Client) ID
 > - `$AppSecret` - Your Service Principal Client Secret
 >
-> **Important:** Save these credentials securely in the script file. The script will validate these values before running.
+> **Security Note:** For development/testing, you can store credentials directly in the script. For production environments, consider using:
+> - **Azure Key Vault** - Recommended for production scenarios
+> - **Environment Variables** - Can be set in Task Scheduler or automation platforms
+> - **Encrypted Configuration Files** - Use PowerShell SecureString or similar encryption methods
 
 #### ✅ Step 4: Run Script  
 > Open PowerShell and run the Final PS Script - Service Principal. You can:  
@@ -124,7 +129,7 @@ Before running this Service Principal version, you need to:
 > This version uses Azure AD Service Principal (App Registration) authentication for unattended execution:
 > - **No interactive login required** - Credentials are configured directly in the script
 > - **Perfect for automation** - Can be scheduled to run automatically via Task Scheduler, Azure Automation, or CI/CD pipelines
-> - **Secure credential management** - Client secrets should be stored securely (consider using Azure Key Vault for production scenarios)
+> - **Secure credential management** - For production use, store credentials securely using Azure Key Vault, environment variables, or encrypted configuration files rather than plain text in scripts
 > - **Requires Power BI Admin setup** - Service Principals must be enabled in Power BI tenant settings and granted appropriate workspace permissions
 > - **Same outputs as interactive version** - All features and functionality are identical, only the authentication method differs
 >
