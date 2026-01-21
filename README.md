@@ -59,7 +59,7 @@ Before running this Service Principal version, you need to:
    - In Power BI Admin Portal → Tenant settings:
      - Enable "Allow service principals to use Power BI APIs"
      - Add your security group to this setting
-   - Grant the Service Principal appropriate workspace access (Admin, Member, or Contributor roles)
+   - Add the Service Principal to the workspaces you want to run this on (Admin or Member access).
 
 3. **Configure the Script**
    - Open `Final PS Script - Service Principal.txt`
@@ -69,8 +69,6 @@ Before running this Service Principal version, you need to:
      $AppId = "YOUR_APP_ID"              # Your Service Principal Application (Client) ID  
      $AppSecret = "YOUR_APP_SECRET"      # Your Service Principal Client Secret
      ```
-   - **For development/testing:** You can store credentials directly in the script file
-   - **For production:** Use secure credential storage (Azure Key Vault, environment variables, etc.)
 
 ---
 
