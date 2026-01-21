@@ -65,12 +65,12 @@ if ($TenantId -eq "YOUR_TENANT_ID" -or $AppId -eq "YOUR_APP_ID" -or $AppSecret -
     $messageLabel.Text = @"
 This script requires Service Principal credentials to run.
 
-Please update the following values at the TOP of this script file:
-(Lines 31-33 in "Final PS Script - Service Principal.txt")
+Please update the following values at the TOP of this script file
+in the 'Service Principal Configuration' section:
 
-   • `$TenantId    - Your Azure AD Tenant ID
-   • `$AppId       - Your Service Principal Application (Client) ID
-   • `$AppSecret   - Your Service Principal Client Secret
+   • TenantId    - Your Azure AD Tenant ID
+   • AppId       - Your Service Principal Application (Client) ID
+   • AppSecret   - Your Service Principal Client Secret
 
 For detailed setup instructions, please refer to the README.md file.
 
@@ -89,7 +89,7 @@ The script will now exit. Please configure the credentials and run again.
     $form.AcceptButton = $okButton
     
     # Show the form
-    $result = $form.ShowDialog()
+    $form.ShowDialog() | Out-Null
     
     # Exit after user clicks OK
     exit
