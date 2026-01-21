@@ -65,7 +65,7 @@ if ($TenantId -eq "YOUR_TENANT_ID" -or $AppId -eq "YOUR_APP_ID" -or $AppSecret -
     $messageLabel.Text = @"
 This script requires Service Principal credentials to run.
 
-Please update the following values at the TOP of this script file
+Please update the following values at the top of this script file
 in the 'Service Principal Configuration' section:
 
    • TenantId    - Your Azure AD Tenant ID
