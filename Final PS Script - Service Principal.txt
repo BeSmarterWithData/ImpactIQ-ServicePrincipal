@@ -1,0 +1,2637 @@
+# ================================================================================
+# POWER BI GOVERNANCE SOLUTION - SERVICE PRINCIPAL AUTHENTICATION VERSION
+# ================================================================================
+# This is an alternate version of the Final PS Script that uses Service Principal
+# authentication instead of interactive MSAL (Connect-PowerBIServiceAccount).
+# 
+# Use this version when you want to run the script unattended or with a service
+# principal that has been granted the necessary Power BI Service Administrator role.
+#
+# For the interactive MSAL version, use "Final PS Script.txt"
+# ================================================================================
+
+# Define the base folder and script paths at the beginning of the script
+
+$global:BaseFolderPath = "C:\Power BI Backups"
+$global:ConfigFolder   = Join-Path $global:BaseFolderPath "Config"
+
+$baseFolderPath = $global:BaseFolderPath
+$configFolder   = $global:ConfigFolder
+
+$Script1Path = Join-Path $configFolder "Report Detail Extract Script-PBIR.csx"
+$Script2Path = Join-Path $configFolder "Report Detail Extract Script.csx"
+$Script3Path = Join-Path $configFolder "Model Detail Extract Script.csx"
+$Script4Path = Join-Path $configFolder "Measure Dependency Extract Script.csx"
+$TabularEditor2Path = Join-Path (Join-Path $configFolder "TabularEditor") "TabularEditor.exe"
+
+# =============================
+# Service Principal Configuration
+# =============================
+# IMPORTANT: Set these values before running the script
+$TenantId = "YOUR_TENANT_ID"        # Your Azure AD Tenant ID
+$AppId = "YOUR_APP_ID"              # Your Service Principal Application (Client) ID  
+$AppSecret = "YOUR_APP_SECRET"      # Your Service Principal Client Secret
+
+# Validate service principal configuration
+if ($TenantId -eq "YOUR_TENANT_ID" -or $AppId -eq "YOUR_APP_ID" -or $AppSecret -eq "YOUR_APP_SECRET") {
+    Write-Error "Please configure the service principal credentials (TenantId, AppId, AppSecret) at the top of this script before running."
+    exit
+}
+
+
+# =============================
+# Config
+# =============================
+
+# Ensure Config exists
+if (-not (Test-Path $configFolder)) {
+    New-Item -Path $configFolder -ItemType Directory -Force | Out-Null
+}
+
+
+$global:TokenFilePath = Join-Path $configFolder "PowerBI_AccessToken.txt"
+
+
+$ErrorActionPreference="SilentlyContinue"; $WarningPreference="SilentlyContinue"
+
+# Temporarily set execution policy to Bypass for this session
+if ((Get-ExecutionPolicy) -ne 'Bypass') {
+    Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force
+}
+
+# =============================
+# Download latest pbi-tools
+# =============================
+
+$pbiToolsZip = Join-Path $configFolder "PBI Tools.zip"
+
+Write-Host "[INFO] Fetching latest pbi-tools release..."
+$pbiRelease = Invoke-RestMethod -Uri "https://api.github.com/repos/pbi-tools/pbi-tools/releases/latest"
+$pbiAsset   = $pbiRelease.assets | Where-Object { $_.name -like "*.zip" } | Select-Object -First 1
+
+if ($pbiAsset -and $pbiAsset.browser_download_url) {
+    if (Test-Path $pbiToolsZip) { Remove-Item $pbiToolsZip -Force }
+    Invoke-WebRequest -Uri $pbiAsset.browser_download_url -OutFile $pbiToolsZip -UseBasicParsing
+    Write-Host "[INFO] Downloaded latest pbi-tools to $pbiToolsZip"
+} else {
+    Write-Warning "[WARN] Could not find a valid pbi-tools zip asset."
+}
+
+# =============================
+# Download latest Tabular Editor 2 Portable
+# =============================
+
+$teZip = Join-Path $configFolder "TabularEditor.zip"
+$teDownloadUrl = "https://github.com/TabularEditor/TabularEditor/releases/latest/download/TabularEditor.Portable.zip"
+
+Write-Host "[INFO] Downloading latest Tabular Editor 2 Portable..."
+if (Test-Path $teZip) { Remove-Item $teZip -Force }
+Invoke-WebRequest -Uri $teDownloadUrl -OutFile $teZip -UseBasicParsing
+Write-Host "[INFO] Downloaded Tabular Editor 2 Portable to $teZip"
+
+# Define the folder path and zip pattern for PBI Tools
+$PBIToolsFolderPath = Join-Path -Path $baseFolderPath\Config -ChildPath "PBI Tools"
+$PBIToolsZipPattern = "PBI Tools*.zip"
+
+# Get the first matching zip file
+$zipFile = Get-ChildItem -Path $baseFolderPath\Config -Filter $PBIToolsZipPattern | Select-Object -First 1
+if ($zipFile) {
+    # Remove the folder if it already exists
+    if (Test-Path -Path $PBIToolsFolderPath) {
+        Remove-Item -Path $PBIToolsFolderPath -Recurse -Force
+    }
+
+    # Recreate the folder
+    New-Item -Path $PBIToolsFolderPath -ItemType Directory -Force | Out-Null
+
+    # Extract the zip file contents into the folder
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    [System.IO.Compression.ZipFile]::ExtractToDirectory($zipFile.FullName, $PBIToolsFolderPath)
+    Write-Output "Extracted $($zipFile.Name) to $PBIToolsFolderPath"
+}
+
+# Repeat for Tabular Editor
+$TabularEditorFolderPath = Join-Path -Path $baseFolderPath\Config -ChildPath "TabularEditor"
+$TabularEditorZipPattern = "TabularEditor*.zip"
+
+$zipFile = Get-ChildItem -Path $baseFolderPath\Config -Filter $TabularEditorZipPattern | Select-Object -First 1
+if ($zipFile) {
+    if (Test-Path -Path $TabularEditorFolderPath) {
+        Remove-Item -Path $TabularEditorFolderPath -Recurse -Force
+    }
+
+    New-Item -Path $TabularEditorFolderPath -ItemType Directory -Force | Out-Null
+
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    [System.IO.Compression.ZipFile]::ExtractToDirectory($zipFile.FullName, $TabularEditorFolderPath)
+    Write-Output "Extracted $($zipFile.Name) to $TabularEditorFolderPath"
+} else {
+}
+
+
+$pbiToolsPath = Join-Path -Path $baseFolderPath -ChildPath "Config\PBI Tools\pbi-tools.exe"
+
+
+# Ensure required modules are installed, and imports them. If import fails, error and exit early
+$requiredModules = @( 'ImportExcel', 'MicrosoftPowerBIMgmt' )
+foreach ($module in $requiredModules) {
+    if( -not (Import-Module $module -PassThru -EA ignore) ) {
+       Install-Module -Name $module -Scope CurrentUser -Force
+    }
+
+    Import-Module $Module -ErrorAction 'stop' # In the rare case Install-Module fails, you probably want a terminating error
+}
+
+
+# ================================
+# Read-Host With 60 Second Timeout
+# ================================
+function Read-HostWithTimeout {
+    param(
+        [string]$Prompt,
+        [int]$TimeoutSeconds = 60
+    )
+
+    Write-Host -NoNewline "$Prompt "
+    Write-Host "(waiting up to $TimeoutSeconds seconds):" -ForegroundColor DarkGray
+
+    $inputBuffer = ""
+    $endTime = (Get-Date).AddSeconds($TimeoutSeconds)
+
+    while ((Get-Date) -lt $endTime) {
+        if ([Console]::KeyAvailable) {
+            $key = [Console]::ReadKey($true)
+            # Enter pressed - stop reading
+            if ($key.Key -eq "Enter") {
+                Write-Host ""
+                return $inputBuffer
+            }
+            # Backspace
+            elseif ($key.Key -eq "Backspace") {
+                if ($inputBuffer.Length -gt 0) {
+                    $inputBuffer = $inputBuffer.Substring(0, $inputBuffer.Length - 1)
+                    Write-Host -NoNewline "`b `b"
+                }
+            }
+            else {
+                $inputBuffer += $key.KeyChar
+                Write-Host -NoNewline $key.KeyChar
+            }
+        }
+        Start-Sleep -Milliseconds 100
+    }
+
+    Write-Host "Timeout reached - defaulting to Public" -ForegroundColor Yellow
+    return ""
+}
+
+# ================================
+# Show Environment Selection Dialog
+# ================================
+function Show-EnvironmentSelectionDialog {
+    param(
+        [int]$TimeoutSeconds = 60
+    )
+
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = "Select Power BI Environment"
+    $form.StartPosition = 'CenterScreen'
+    $form.Size = New-Object System.Drawing.Size(400, 320)
+    $form.TopMost = $true
+    $form.FormBorderStyle = 'FixedDialog'
+    $form.MaximizeBox = $false
+
+    # Label
+    $label = New-Object System.Windows.Forms.Label
+    $label.Text = "Select your Power BI cloud environment:"
+    $label.AutoSize = $true
+    $label.Location = New-Object System.Drawing.Point(20, 20)
+    $form.Controls.Add($label)
+
+    # ListBox for environment selection
+    $listBox = New-Object System.Windows.Forms.ListBox
+    $listBox.Location = New-Object System.Drawing.Point(20, 50)
+    $listBox.Size = New-Object System.Drawing.Size(340, 150)
+    $listBox.SelectionMode = 'One'
+    
+    # Add environment options
+    $environments = @(
+        'Public (Commercial)',
+        'Germany',
+        'USGov',
+        'China',
+        'USGovHigh',
+        'USGovMil'
+    )
+    
+    foreach ($env in $environments) {
+        [void]$listBox.Items.Add($env)
+    }
+    
+    # Set default selection to Public
+    $listBox.SelectedIndex = 0
+    $form.Controls.Add($listBox)
+
+    # Timeout label
+    $timeoutLabel = New-Object System.Windows.Forms.Label
+    $timeoutLabel.Text = "Timeout in $TimeoutSeconds seconds (defaults to Public)"
+    $timeoutLabel.AutoSize = $true
+    $timeoutLabel.Location = New-Object System.Drawing.Point(20, 210)
+    $timeoutLabel.ForeColor = [System.Drawing.Color]::Gray
+    $form.Controls.Add($timeoutLabel)
+
+    # OK button
+    $okButton = New-Object System.Windows.Forms.Button
+    $okButton.Text = "OK"
+    $okButton.Size = New-Object System.Drawing.Size(75, 30)
+    $okButton.Location = New-Object System.Drawing.Point(205, 240)
+    $okButton.Add_Click({
+        $form.Tag = $listBox.SelectedItem
+        $form.Close()
+    })
+    $form.Controls.Add($okButton)
+
+    # Cancel button
+    $cancelButton = New-Object System.Windows.Forms.Button
+    $cancelButton.Text = "Cancel"
+    $cancelButton.Size = New-Object System.Drawing.Size(75, 30)
+    $cancelButton.Location = New-Object System.Drawing.Point(285, 240)
+    $cancelButton.Add_Click({
+        $form.Tag = 'Cancelled'
+        $form.Close()
+    })
+    $form.Controls.Add($cancelButton)
+
+    # Timer for timeout
+    $timer = New-Object System.Windows.Forms.Timer
+    $timer.Interval = $TimeoutSeconds * 1000
+    $timer.Add_Tick({
+        $timer.Stop()
+        $form.Tag = 'Timeout'
+        $form.Close()
+    })
+
+    # Add FormClosing event handler
+    $form.Add_FormClosing({
+        param($sender, $e)
+        $timer.Stop()
+        $timer.Dispose()
+        
+        # If Tag is not set (form closed without button click), mark as cancelled
+        if (-not $form.Tag) {
+            $form.Tag = 'Cancelled'
+        }
+    })
+
+    # Handle double-click on list item (same as OK button)
+    $listBox.Add_DoubleClick({
+        $form.Tag = $listBox.SelectedItem
+        $form.Close()
+    })
+
+    # Set default button and show
+    $form.AcceptButton = $okButton
+    $form.CancelButton = $cancelButton
+    $timer.Start()
+    [void]$form.ShowDialog()
+
+    return $form.Tag
+}
+
+# ============================================
+# Prompt for Power BI Environment + Validation
+# ============================================
+if (-not (Get-Variable -Name LoginEnvironment -Scope Script -ErrorAction SilentlyContinue)) {
+
+    $selectedEnv = Show-EnvironmentSelectionDialog -TimeoutSeconds 60
+
+    # Handle timeout, cancellation, or no selection
+    if ($selectedEnv -eq 'Timeout' -or $selectedEnv -eq 'Cancelled' -or [string]::IsNullOrWhiteSpace($selectedEnv)) {
+        Write-Host "No environment selected or timeout reached - defaulting to Public" -ForegroundColor Yellow
+        $LoginEnvironment = 'Public'
+    }
+    else {
+        # Extract the environment name from the display text
+        # The format is "EnvironmentName" or "EnvironmentName (Description)"
+        $envName = $selectedEnv -replace ' \(.*\)', ''
+        
+        switch ($envName.Trim()) {
+            'Public'       { $LoginEnvironment = 'Public' ; break }
+            'Germany'      { $LoginEnvironment = 'Germany' ; break }
+            'USGovHigh'    { $LoginEnvironment = 'USGovHigh' ; break }
+            'USGovMil'     { $LoginEnvironment = 'USGovMil' ; break }
+            'USGov'        { $LoginEnvironment = 'USGov' ; break }
+            'China'        { $LoginEnvironment = 'China' ; break }
+            default {
+                Write-Warning "Unrecognized environment '$selectedEnv'. Defaulting to 'Public'."
+                $LoginEnvironment = 'Public'
+            }
+        }
+        
+        Write-Host "[INFO] Selected environment: $LoginEnvironment" -ForegroundColor Green
+    }
+}
+
+function Get-PowerBIEndpoints {
+    param(
+        [string]$Environment
+    )
+    
+    # Default endpoints for Public cloud
+    $endpoints = @{
+        ApiPrefix      = 'https://api.powerbi.com'
+        XmlaPrefix     = 'powerbi://api.powerbi.com'
+        WebPrefix      = 'https://app.powerbi.com'
+        ResourceUrl    = 'https://analysis.windows.net/powerbi/api'
+        EmbedUrl       = 'https://app.powerbi.com/reportEmbed'
+        LoginUrl       = 'https://login.microsoftonline.com'
+        FabricApiPrefix = 'https://api.fabric.microsoft.com'
+    }
+    
+    # Override endpoints based on environment
+    switch ($Environment) {
+        'Germany' {
+            $endpoints.ApiPrefix = 'https://api.powerbi.de'
+            $endpoints.XmlaPrefix = 'powerbi://api.powerbi.de'
+            $endpoints.WebPrefix = 'https://app.powerbi.de'
+            $endpoints.ResourceUrl = 'https://analysis.cloudapi.de/powerbi/api'
+            $endpoints.EmbedUrl = 'https://app.powerbi.de/reportEmbed'
+            $endpoints.LoginUrl = 'https://login.microsoftonline.com'
+            $endpoints.FabricApiPrefix = 'https://api.fabric.microsoft.de'
+        }
+        'China' {
+            $endpoints.ApiPrefix = 'https://api.powerbi.cn'
+            $endpoints.XmlaPrefix = 'powerbi://api.powerbi.cn'
+            $endpoints.WebPrefix = 'https://app.powerbi.cn'
+            $endpoints.ResourceUrl = 'https://analysis.chinacloudapi.cn/powerbi/api'
+            $endpoints.EmbedUrl = 'https://app.powerbi.cn/reportEmbed'
+            $endpoints.LoginUrl = 'https://login.partner.microsoftonline.cn'
+            $endpoints.FabricApiPrefix = 'https://api.fabric.microsoft.cn'
+        }
+        'USGov' {
+            $endpoints.ApiPrefix = 'https://api.powerbigov.us'
+            $endpoints.XmlaPrefix = 'powerbi://api.powerbigov.us'
+            $endpoints.WebPrefix = 'https://app.powerbigov.us'
+            $endpoints.ResourceUrl = 'https://analysis.usgovcloudapi.net/powerbi/api'
+            $endpoints.EmbedUrl = 'https://app.powerbigov.us/reportEmbed'
+            $endpoints.LoginUrl = 'https://login.microsoftonline.com'
+            $endpoints.FabricApiPrefix = 'https://api.fabric.microsoft.us'
+        }
+        'USGovHigh' {
+            $endpoints.ApiPrefix = 'https://api.high.powerbigov.us'
+            $endpoints.XmlaPrefix = 'powerbi://api.high.powerbigov.us'
+            $endpoints.WebPrefix = 'https://app.high.powerbigov.us'
+            $endpoints.ResourceUrl = 'https://analysis.high.usgovcloudapi.net/powerbi/api'
+            $endpoints.EmbedUrl = 'https://app.high.powerbigov.us/reportEmbed'
+            $endpoints.LoginUrl = 'https://login.microsoftonline.us'
+            $endpoints.FabricApiPrefix = 'https://api.fabric.high.microsoft.us'
+        }
+        'USGovMil' {
+            $endpoints.ApiPrefix = 'https://api.mil.powerbi.us'
+            $endpoints.XmlaPrefix = 'powerbi://api.mil.powerbi.us'
+            $endpoints.WebPrefix = 'https://app.mil.powerbi.us'
+            $endpoints.ResourceUrl = 'https://analysis.dod.usgovcloudapi.net/powerbi/api'
+            $endpoints.EmbedUrl = 'https://app.mil.powerbi.us/reportEmbed'
+            $endpoints.LoginUrl = 'https://login.microsoftonline.us'
+            $endpoints.FabricApiPrefix = 'https://api.fabric.mil.microsoft.us'
+        }
+    }
+    
+    return $endpoints
+}
+
+# Initialize endpoints based on selected environment (store for later, before it becomes $null for Public)
+$EnvironmentForEndpoints = if ($LoginEnvironment) { $LoginEnvironment } else { 'Public' }
+$global:PowerBIEndpoints = Get-PowerBIEndpoints -Environment $EnvironmentForEndpoints
+
+# Connect to the Power BI Service using Service Principal
+function Connect-PowerBI {
+    param(
+        [string]$Environment
+    )
+
+    # Get access token using service principal
+    $authority = "$($global:PowerBIEndpoints.LoginUrl)/$TenantId"
+    $resourceUrl = $global:PowerBIEndpoints.ResourceUrl
+    
+    $body = @{
+        grant_type    = "client_credentials"
+        client_id     = $AppId
+        client_secret = $AppSecret
+        resource      = $resourceUrl
+    }
+    
+    $tokenEndpoint = "$authority/oauth2/token"
+    
+    try {
+        $response = Invoke-RestMethod -Method Post -Uri $tokenEndpoint -Body $body -ContentType "application/x-www-form-urlencoded"
+        $global:accessToken = $response.access_token
+        
+        Set-Content -Path $global:TokenFilePath -Value $global:accessToken
+        
+        Write-Host "[INFO] Successfully authenticated using service principal"
+    }
+    catch {
+        Write-Error "Failed to authenticate with service principal: $_"
+        throw
+    }
+}
+
+# Track script start time
+$scriptStartTime = Get-Date
+
+Write-Host "[INFO] Connecting to Power BI using service principal in environment: $EnvironmentForEndpoints"
+Connect-PowerBI -Environment $LoginEnvironment
+
+
+# Function to refresh the token in a background job
+# Start a background job that refreshes the token. Pass the environment and credentials so child job can reconnect correctly.
+function Start-TokenRefreshJob {
+    param(
+        [string]$Environment,
+        [string]$BaseFolderPath
+    )
+
+    $jobScript = {
+        param($EnvArg, $TenantIdArg, $AppIdArg, $AppSecretArg, $EndpointsArg, $BaseFolderPathArg)
+
+        $tokenDirectory = Join-Path -Path $BaseFolderPathArg -ChildPath 'Config'
+        if (-not (Test-Path -Path $tokenDirectory)) {
+            New-Item -Path $tokenDirectory -ItemType Directory -Force | Out-Null
+        }
+        $tokenFilePath = Join-Path -Path $tokenDirectory -ChildPath 'PowerBI_AccessToken.txt'
+
+        function Connect-PowerBI {
+            param(
+                [string]$Environment,
+                [string]$TokenFilePath
+            )
+
+            # Get access token using service principal
+            $authority = "$($EndpointsArg.LoginUrl)/$TenantIdArg"
+            $resourceUrl = $EndpointsArg.ResourceUrl
+            
+            $body = @{
+                grant_type    = "client_credentials"
+                client_id     = $AppIdArg
+                client_secret = $AppSecretArg
+                resource      = $resourceUrl
+            }
+            
+            $tokenEndpoint = "$authority/oauth2/token"
+            
+            try {
+                $response = Invoke-RestMethod -Method Post -Uri $tokenEndpoint -Body $body -ContentType "application/x-www-form-urlencoded"
+                $global:accessToken = $response.access_token
+                Set-Content -Path $TokenFilePath -Value $global:accessToken
+            }
+            catch {
+                Write-Error "Token refresh failed: $_"
+            }
+        }
+
+        while ($true) {
+            Start-Sleep -Seconds 3300  # Sleep for 55 minutes
+            Connect-PowerBI -Environment $EnvArg -TokenFilePath $tokenFilePath
+        }
+    }
+
+    # Start the job and pass the environment and credentials as arguments
+    Start-Job -ScriptBlock $jobScript -Name "TokenRefreshJob" -ArgumentList $Environment, $TenantId, $AppId, $AppSecret, $global:PowerBIEndpoints, $BaseFolderPath | Out-Null
+}
+
+# Start the background job to refresh the token
+Start-TokenRefreshJob -Environment $LoginEnvironment -BaseFolderPath $global:BaseFolderPath
+
+# Function to get the current access token
+function Get-CurrentAccessToken {
+    $global:accessToken = Get-Content -Path $global:TokenFilePath
+    return $global:accessToken
+}
+
+# Wrapper function to replace Invoke-PowerBIRestMethod with service principal authentication
+# This overrides the MicrosoftPowerBIMgmt module's Invoke-PowerBIRestMethod cmdlet
+# to use our service principal token instead of requiring Connect-PowerBIServiceAccount
+function Invoke-PowerBIRestMethod {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Url,
+
+        [Parameter(Mandatory)]
+        [ValidateSet('GET','POST','PUT','PATCH','DELETE')]
+        [string]$Method,
+
+        [string]$Body,
+
+        [string]$ContentType = "application/json"
+    )
+
+    $token = Get-CurrentAccessToken
+
+    if (-not $token) {
+        throw "No Power BI access token available. Call Connect-PowerBIServiceAccount first."
+    }
+
+    $headers = @{
+        Authorization = "Bearer $token"
+    }
+
+    try {
+        $params = @{
+            Uri         = $Url
+            Method      = $Method
+            Headers     = $headers
+            ErrorAction = 'Stop'
+        }
+
+        if ($Body) {
+            $params.Body        = $Body
+            $params.ContentType = $ContentType
+        }
+
+        $response = Invoke-RestMethod @params
+
+        # Match native Invoke-PowerBIRestMethod behavior
+        if ($null -eq $response) {
+            return $null
+        }
+
+        if ($response -is [string]) {
+            return $response
+        }
+
+        return ($response | ConvertTo-Json -Depth 100 -Compress)
+    }
+    catch {
+        if ($ErrorActionPreference -eq 'SilentlyContinue') {
+            return $null
+        }
+
+        Write-Warning "Invoke-PowerBIRestMethod failed: $Url"
+        Write-Warning $_.Exception.Message
+        throw
+    }
+}
+
+# Create a variable date
+$date = (Get-Date -UFormat "%Y-%m-%d")
+
+
+
+
+
+
+
+
+#### Start of Power BI Environment Detail Extract ####
+
+
+
+
+
+
+
+Write-Output "Power BI Environment Detail Extract Process Started"
+
+# Define the Information Extract Excel file path
+$excelFile = "$baseFolderPath\Power BI Environment Detail.xlsx"
+
+# Function to rename properties in objects and handle duplicates
+
+# Track script start time
+$scriptStartTime = Get-Date
+
+try {
+    Connect-PowerBI -Environment $LoginEnvironment -ErrorAction Stop | Out-Null
+    # Service principal authentication - no user interaction required
+}
+catch {
+    Write-Host "[INFO] Connecting to Power BI using environment: $EnvironmentForEndpoints"
+    Connect-PowerBI -Environment $LoginEnvironment
+}
+
+
+# Function to refresh the token in a background job
+# Start a background job that refreshes the token. Pass the environment so child job can reconnect correctly.
+function Start-TokenRefreshJob {
+    param(
+        [string]$Environment,
+        [string]$BaseFolderPath
+    )
+
+    $jobScript = {
+        param($EnvArg, $BaseFolderPathArg)
+
+        $tokenDirectory = Join-Path -Path $BaseFolderPathArg -ChildPath 'Config'
+        if (-not (Test-Path -Path $tokenDirectory)) {
+            New-Item -Path $tokenDirectory -ItemType Directory -Force | Out-Null
+        }
+        $tokenFilePath = Join-Path -Path $tokenDirectory -ChildPath 'PowerBI_TempAccessToken.txt'
+
+        function Connect-PowerBI {
+            param(
+                [string]$Environment,
+                [string]$TokenFilePath
+            )
+
+            if ($Environment) {
+                Connect-PowerBIServiceAccount -Environment $Environment | Out-Null
+            } else {
+                Connect-PowerBIServiceAccount | Out-Null
+            }
+            $global:accessTokenObject = Get-PowerBIAccessToken
+            $global:accessToken = $accessTokenObject.Authorization -replace 'Bearer ', ''
+            Set-Content -Path $TokenFilePath -Value $global:accessToken
+        }
+
+        while ($true) {
+            Start-Sleep -Seconds 3300  # Sleep for 55 minutes
+            Connect-PowerBI -Environment $EnvArg -TokenFilePath $tokenFilePath
+        }
+    }
+
+    # Start the job and pass the environment as an argument
+    Start-Job -ScriptBlock $jobScript -Name "TokenRefreshJob" -ArgumentList $Environment, $BaseFolderPath | Out-Null
+}
+
+# Start the background job to refresh the token
+Start-TokenRefreshJob -Environment $LoginEnvironment -BaseFolderPath $global:BaseFolderPath
+
+# Function to get the current access token
+function Get-CurrentAccessToken {
+    $global:accessToken = Get-Content -Path $global:TokenFilePath
+    return $global:accessToken
+}
+
+# Create a variable date
+$date = (Get-Date -UFormat "%Y-%m-%d")
+
+
+
+
+
+
+
+
+
+#### Start of Power BI Environment Detail Extract ####
+
+
+
+
+
+
+
+Write-Output "Power BI Environment Detail Extract Process Started"
+
+# Define the Information Extract Excel file path
+$excelFile = "$baseFolderPath\Power BI Environment Detail.xlsx"
+
+# Function to rename properties in objects and handle duplicates
+function Rename-Properties {
+    param ($object, $renameMap)
+    $newObject = New-Object PSObject
+    foreach ($originalName in $renameMap.Keys) {
+        $newPropertyName = $renameMap[$originalName]
+        $propertyValue = if ($object.PSObject.Properties[$originalName]) { $object.$originalName } else { $null }
+        if ($newObject.PSObject.Properties[$newPropertyName]) { $newPropertyName += "_duplicate" }
+        $newObject | Add-Member -MemberType NoteProperty -Name $newPropertyName -Value $propertyValue
+    }
+    foreach ($property in $object.PSObject.Properties) {
+        if (-not $renameMap.ContainsKey($property.Name)) {
+            $newObject | Add-Member -MemberType NoteProperty -Name $property.Name -Value $property.Value
+        }
+    }
+    return $newObject
+}
+
+function Show-WorkspacePicker {
+    param(
+        [Parameter(Mandatory)]
+        [array]$Workspaces # array of PSCustomObjects with id + name
+    )
+
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+
+    # Form
+    $form               = New-Object System.Windows.Forms.Form
+    $form.Text          = "Select Workspaces"
+    $form.StartPosition = 'CenterScreen'
+    $form.Size          = New-Object System.Drawing.Size(520,580)
+	$form.TopMost       = $true
+
+    # Instruction label
+    $lbl                = New-Object System.Windows.Forms.Label
+    $lbl.Text           = "Select the workspaces to run against:"
+    $lbl.AutoSize       = $true
+    $lbl.Location       = New-Object System.Drawing.Point(12,12)
+    $form.Controls.Add($lbl)
+
+    # Search label
+    $lblSearch          = New-Object System.Windows.Forms.Label
+    $lblSearch.Text     = "Search:"
+    $lblSearch.AutoSize = $true
+    $lblSearch.Location = New-Object System.Drawing.Point(12,40)
+    $form.Controls.Add($lblSearch)
+
+    # Search TextBox
+    $txtSearch          = New-Object System.Windows.Forms.TextBox
+    $txtSearch.Location = New-Object System.Drawing.Point(70,37)
+    $txtSearch.Size     = New-Object System.Drawing.Size(422,23)
+    $form.Controls.Add($txtSearch)
+
+    # CheckedListBox
+    $clb                = New-Object System.Windows.Forms.CheckedListBox
+    $clb.Location       = New-Object System.Drawing.Point(12,70)
+	$clb.Size           = New-Object System.Drawing.Size(480,380)
+    $clb.CheckOnClick   = $true
+    $clb.Sorted         = $true
+
+    # Store all workspace items for filtering
+    $allWorkspaceItems = @()
+    foreach ($ws in $Workspaces) {
+        $display = "{0} ({1})" -f $ws.name, $ws.id
+        $allWorkspaceItems += [pscustomobject]@{ Display=$display; Id=$ws.id; Name=$ws.name }
+    }
+
+    # Maintain persistent checked state across searches
+    $persistentCheckedIds = @{}
+
+    # Initial population
+    foreach ($item in $allWorkspaceItems) {
+        [void]$clb.Items.Add($item)
+    }
+    $clb.DisplayMember = 'Display'
+    $form.Controls.Add($clb)
+
+	# Track when items are checked/unchecked
+    $clb.Add_ItemCheck({
+        param($sender, $e)
+        $item = $clb.Items[$e.Index]
+        if ($e.NewValue -eq 'Checked') {
+            $persistentCheckedIds[$item.Id] = $true
+        } elseif ($e.NewValue -eq 'Unchecked') {
+            $persistentCheckedIds.Remove($item.Id)
+        }
+    })
+
+	# Search filter logic
+    $txtSearch.Add_TextChanged({
+        $searchText = $txtSearch.Text
+        $clb.BeginUpdate()
+        
+        $clb.Items.Clear()
+        
+        # Escape search text once for reuse in loop
+        $escapedSearchText = [regex]::Escape($searchText)
+        
+        # Filter and re-add items
+        foreach ($item in $allWorkspaceItems) {
+            if ([string]::IsNullOrWhiteSpace($searchText) -or 
+                $item.Display -imatch $escapedSearchText) {
+                $index = $clb.Items.Add($item)
+                # Restore checked state from persistent store
+                if ($persistentCheckedIds.ContainsKey($item.Id)) {
+                    $clb.SetItemChecked($index, $true)
+                }
+            }
+        }
+        
+        $clb.EndUpdate()
+    })
+
+    # "Select All" checkbox
+    $chkAll            = New-Object System.Windows.Forms.CheckBox
+    $chkAll.Text       = "Select All"
+    $chkAll.AutoSize   = $true
+    $chkAll.Location   = New-Object System.Drawing.Point(12,460)
+    $chkAll.Add_CheckedChanged({
+        for ($i=0; $i -lt $clb.Items.Count; $i++) {
+            $clb.SetItemChecked($i, $chkAll.Checked)
+        }
+    })
+    $form.Controls.Add($chkAll)
+
+    # "Clear All" button
+    $btnClearAll       = New-Object System.Windows.Forms.Button
+    $btnClearAll.Text  = "Clear All"
+    $btnClearAll.Width = 80
+    $btnClearAll.Location = New-Object System.Drawing.Point(90,458)
+    $btnClearAll.Add_Click({
+        # Uncheck all items - ItemCheck events will update persistent store
+        for ($i=0; $i -lt $clb.Items.Count; $i++) {
+            $clb.SetItemChecked($i, $false)
+        }
+        $chkAll.Checked = $false
+    })
+    $form.Controls.Add($btnClearAll)
+
+    # "Include My Workspace" checkbox
+    $chkMy             = New-Object System.Windows.Forms.CheckBox
+    $chkMy.Text        = "Include 'My Workspace'"
+    $chkMy.AutoSize    = $true
+    $chkMy.Location    = New-Object System.Drawing.Point(184,460)
+    $chkMy.Checked     = $false
+    $form.Controls.Add($chkMy)
+
+    # OK button
+    $okBtn             = New-Object System.Windows.Forms.Button
+    $okBtn.Text        = "OK"
+    $okBtn.Width       = 100
+    $okBtn.Location    = New-Object System.Drawing.Point(286,500)
+    $okBtn.Add_Click({
+        $form.Tag = 'OK'
+        $form.Close()
+    })
+    $form.Controls.Add($okBtn)
+
+    # Cancel button
+    $cancelBtn         = New-Object System.Windows.Forms.Button
+    $cancelBtn.Text    = "Cancel"
+    $cancelBtn.Width   = 100
+    $cancelBtn.Location= New-Object System.Drawing.Point(392,500)
+    $cancelBtn.Add_Click({
+        $form.Tag = 'Cancel'
+        $form.Close()
+    })
+    $form.Controls.Add($cancelBtn)
+
+    # Timer (auto-close after 10 minutes)
+    $timer = New-Object System.Windows.Forms.Timer
+    $timer.Interval = 600000
+    $timer.Add_Tick({
+        $timer.Stop()
+        $form.Tag = 'Timeout'
+        $form.Close()
+    })
+    $timer.Start()
+
+    [void]$form.ShowDialog()
+
+    # Gather selections from persistent store (to include items not currently visible due to search)
+    $selectedIds = @($persistentCheckedIds.Keys)
+
+    if ($form.Tag -eq 'Cancel') {
+        throw "User cancelled workspace selection."
+    }
+
+    $timedOut = ($form.Tag -eq 'Timeout')
+
+    # Include My Workspace only if checked… except on timeout, then force include
+    $includeMy = if ($timedOut) { $true } else { $chkMy.Checked }
+
+    # If nothing selected from workspace list:
+    # - If "Include My Workspace" is checked, process only My Workspace (empty array for regular workspaces)
+    # - Otherwise, default to all workspaces (backwards compatibility with timeout/cancel behavior)
+    if ($selectedIds.Count -eq 0 -and -not $includeMy) {
+        $selectedIds = $Workspaces.id
+    }
+
+    return [pscustomobject]@{
+        SelectedWorkspaceIds = $selectedIds
+        IncludeMyWorkspace   = $includeMy
+        TimedOut             = $timedOut
+    }
+}
+
+
+# Define renaming maps for each type of object
+$workspaceRenameMap = @{
+    "id" = "WorkspaceId";
+    "name" = "WorkspaceName";
+    "isReadOnly" = "WorkspaceIsReadOnly";
+    "isOnDedicatedCapacity" = "WorkspaceIsOnDedicatedCapacity";
+    "capacityId" = "WorkspaceCapacityId";
+    "defaultDatasetStorageFormat" = "WorkspaceDefaultDatasetStorageFormat";
+    "type" = "WorkspaceType"
+}
+
+$datasetRenameMap = @{
+    "id" = "DatasetId";
+    "name" = "DatasetName";
+    "description" = "DatasetDescription";
+    "webUrl" = "DatasetWebUrl";
+    "addRowsAPIEnabled" = "DatasetAddRowsAPIEnabled";
+    "configuredBy" = "DatasetConfiguredBy";
+    "isRefreshable" = "DatasetIsRefreshable";
+    "isEffectiveIdentityRequired" = "DatasetIsEffectiveIdentityRequired";
+    "isEffectiveIdentityRolesRequired" = "DatasetIsEffectiveIdentityRolesRequired";
+    "isOnPremGatewayRequired" = "DatasetIsOnPremGatewayRequired";
+    "targetStorageMode" = "DatasetTargetStorageMode";
+    "queryScaleOutSettings" = "DatasetQueryScaleOutSettings";
+    "createdDate" = "DatasetCreatedDate"
+}
+
+$datasetDatasourceRenameMap = @{
+    "datasourceType" = "DatasetDatasourceType";
+    "datasourceId" = "DatasetDatasourceId";
+    "gatewayId" = "DatasetDatasourceGatewayId";
+    "connectionDetails" = "DatasetDatasourceConnectionDetails"
+}
+
+$dataflowDatasourceRenameMap = @{
+    "datasourceType" = "DataflowDatasourceType";
+    "datasourceId" = "DataflowDatasourceId";
+    "gatewayId" = "DataflowDatasourceGatewayId";
+    "connectionDetails" = "DataflowDatasourceConnectionDetails"
+}
+
+$datasetRefreshRenameMap = @{
+    "requestId" = "DatasetRefreshRequestId";
+    "id" = "DatasetRefreshId";
+    "startTime" = "DatasetRefreshStartTime";
+    "endTime" = "DatasetRefreshEndTime";
+    "status" = "DatasetRefreshStatus";
+    "refreshType" = "DatasetRefreshType"
+}
+
+$datasetRefreshScheduleRenameMap = @{
+    "enabled" = "DatasetRefreshScheduleEnabled";
+    "localTimeZoneId" = "DatasetRefreshScheduleLocalTimeZoneId";
+    "notifyOption" = "DatasetRefreshScheduleNotifyOption"
+}
+
+$dataflowRenameMap = @{
+    "configuredBy"      = "DataflowConfiguredBy";
+    "description"       = "DataflowDescription";
+    "modelUrl"         = "DataflowJsonURL";
+    "modifiedBy"       = "DataflowModifiedBy";
+    "modifiedDateTime" = "DataflowModifiedDateTime";
+    "name"             = "DataflowName";
+    "objectId"         = "DataflowId";
+    "generation" = "DataflowGeneration"
+}
+
+# Define renaming map for Fabric Dataflows (Gen 2 CICD)
+$fabricDataflowRenameMap = @{
+    "id" = "DataflowId";
+    "displayName" = "DataflowName";
+    "description" = "DataflowDescription"
+}
+
+$dataflowRefreshRenameMap = @{
+    "requestId" = "DataflowRefreshRequestId";
+    "id" = "DataflowRefreshId";
+    "startTime" = "DataflowRefreshStartTime";
+    "endTime" = "DataflowRefreshEndTime";
+    "status" = "DataflowRefreshStatus" ;
+    "refreshType" = "DataflowRefreshType" ;
+    "errorInfo" = "DataflowErrorInfo"
+}
+
+$dataflowLineageRenameMap = @{
+    "datasetObjectId"   = "DatasetId";
+    "dataflowObjectId"  = "DataflowId";
+    "workspaceObjectId" = "WorkspaceId"
+}
+
+$reportRenameMap = @{
+    "id" = "ReportId";
+    "name" = "ReportName";
+    "description" = "ReportDescription";
+    "webUrl" = "ReportWebUrl";
+    "embedUrl" = "ReportEmbedUrl";
+    "isFromPbix" = "ReportIsFromPbix";
+    "isOwnedByMe" = "ReportIsOwnedByMe";
+    "datasetId" = "DatasetId";
+    "datasetWorkspaceId" = "DatasetWorkspaceId";
+    "reportType" = "ReportType"
+}
+
+$pageRenameMap = @{
+    "name" = "PageName";
+    "displayName" = "PageDisplayName";
+    "order" = "PageOrder"
+}
+
+$appRenameMap = @{
+    "id" = "AppId";
+    "name" = "AppName";
+    "lastUpdate" = "AppLastUpdate";
+    "description" = "AppDescription";
+    "publishedBy" = "AppPublishedBy";
+    "workspaceId" = "AppWorkspaceId";
+    "users" = "AppUsers"
+}
+
+$appReportRenameMap = @{
+    "id" = "AppReportId";
+    "reportType" = "AppReportType";
+    "name" = "ReportName";
+    "webUrl" = "AppReportWebUrl";
+    "embedUrl" = "AppReportEmbedUrl";
+    "isOwnedByMe" = "AppReportIsOwnedByMe";
+    "datasetId" = "AppReportDatasetId";
+    "originalReportObjectId" = "ReportId";
+    "users" = "AppUsers";
+    "subscriptions" = "AppReportSubscriptions";
+    "sections" = "AppReportSections"
+}
+
+# Define renaming map for Fabric Items
+$fabricItemsRenameMap = @{
+    "id" = "FabricItemID";
+    "type" = "FabricItemType";
+    "displayName" = "FabricItemName";
+    "description" = "FabricItemDescription"
+}
+
+
+# Fetch and filter workspaces
+$workspacesUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups"
+$workspacesResponse = Invoke-PowerBIRestMethod -Method GET -Url $workspacesUrl | ConvertFrom-Json
+$workspacesInfo = @()
+
+# --- Try WinForms picker; fallback if GUI not available ---
+try {
+    $selection = Show-WorkspacePicker -Workspaces $workspacesResponse.value
+}
+catch {
+    Write-Warning "WinForms not available. Defaulting to ALL workspaces and INCLUDING My Workspace."
+    $selection = [pscustomobject]@{
+        SelectedWorkspaceIds = $workspacesResponse.value.id
+        IncludeMyWorkspace   = $true
+    }
+}
+
+# Build filtered workspaces
+$selectedWorkspaceIds = @($selection.SelectedWorkspaceIds)
+
+if (-not $selectedWorkspaceIds -or $selectedWorkspaceIds.Count -eq 0) {
+    throw "No workspaces selected."
+}
+
+foreach ($workspace in $workspacesResponse.value) {
+    if ($selectedWorkspaceIds -notcontains $workspace.id) { continue }
+    $workspacesInfo += Rename-Properties -object $workspace -renameMap $workspaceRenameMap
+}
+
+# Flag for later "My Workspace" section
+$IncludeMyWorkspace = $selection.IncludeMyWorkspace
+
+
+# Initialize collections for all necessary information
+$fabricItemsInfo = @()
+$datasetsInfo = @()
+$datasetSourcesInfo = @()
+$dataflowsInfo = @()
+$dataflowLineage = @()
+$dataflowSourcesInfo = @()
+$reportsInfo = @()
+$reportPagesInfo = @()
+$appsInfo = @()
+$reportsInAppInfo = @()
+$datasetNameLookup = @{}
+$dataflowNameLookup = @{}
+$datasetRefreshHistory = @()
+$datasetRefreshSchedule = @()
+$dataflowRefreshHistory = @()
+
+
+# Loop through filtered workspaces
+foreach ($workspace in $workspacesInfo) {
+
+Write-Output "Workspace [$($workspace.WorkspaceName)] Report & Model metadata extraction process started."
+
+    # Fetch datasets
+    $datasetsUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups/$($workspace.WorkspaceId)/datasets"
+    $datasets = Invoke-PowerBIRestMethod -Method GET -Url $datasetsUrl | ConvertFrom-Json
+
+    foreach ($dataset in $datasets.value) {
+        $renamedDataset = Rename-Properties -object $dataset -renameMap $datasetRenameMap
+        $renamedDataset | Add-Member -NotePropertyName "WorkspaceId" -NotePropertyValue $workspace.WorkspaceId -Force
+        $renamedDataset | Add-Member -NotePropertyName "WorkspaceName" -NotePropertyValue $workspace.WorkspaceName -Force
+        
+    # Store the DatasetId and DatasetName in the lookup table
+        $datasetNameLookup[$dataset.id] = $dataset.name
+        $datasetsInfo += $renamedDataset
+
+        # Fetch dataset sources
+        $datasourcesUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups/$($workspace.WorkspaceId)/datasets/$($dataset.id)/datasources"
+        $datasources = Invoke-PowerBIRestMethod -Method GET -Url $datasourcesUrl | ConvertFrom-Json
+
+        foreach ($datasource in $datasources.value) {
+            $renamedDatasource = Rename-Properties -object $datasource -renameMap $datasetDatasourceRenameMap
+            $renamedDatasource | Add-Member -NotePropertyName "WorkspaceId" -NotePropertyValue $workspace.WorkspaceId -Force
+            $renamedDatasource | Add-Member -NotePropertyName "WorkspaceName" -NotePropertyValue $workspace.WorkspaceName -Force
+            $renamedDatasource | Add-Member -NotePropertyName "DatasetId" -NotePropertyValue $dataset.id -Force
+            $renamedDatasource | Add-Member -NotePropertyName "DatasetName" -NotePropertyValue $dataset.name -Force
+            if ($datasource.connectionDetails) {
+                $renamedDatasource.DatasetDatasourceConnectionDetails = $datasource.connectionDetails | ConvertTo-Json -Compress
+            }
+            $datasetSourcesInfo += $renamedDatasource
+        }
+    }
+
+    # Fetch reports
+    $reportsUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups/$($workspace.WorkspaceId)/reports"
+    $reports = Invoke-PowerBIRestMethod -Method GET -Url $reportsUrl | ConvertFrom-Json
+
+	# Create a hash set to store Report IDs
+	$reportIds = @{}
+
+    foreach ($report in $reports.value) {
+        $renamedReport = Rename-Properties -object $report -renameMap $reportRenameMap
+        $renamedReport | Add-Member -NotePropertyName "WorkspaceId" -NotePropertyValue $workspace.WorkspaceId -Force
+        $renamedReport | Add-Member -NotePropertyName "WorkspaceName" -NotePropertyValue $workspace.WorkspaceName -Force
+
+
+        # Retrieve and add the correct DatasetName from the lookup table if DatasetId exists
+        $datasetId = $report.datasetId
+        if ($datasetId -and $datasetNameLookup.ContainsKey($datasetId)) {
+            $renamedReport | Add-Member -NotePropertyName "DatasetName" -NotePropertyValue $datasetNameLookup[$datasetId] -Force
+        } else {
+            $renamedReport | Add-Member -NotePropertyName "DatasetName" -NotePropertyValue "Unknown Dataset" -Force
+        }
+
+        $reportsInfo += $renamedReport
+
+        # Fetch report pages
+        $pagesUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups/$($workspace.WorkspaceId)/reports/$($report.id)/pages"
+        $pages = Invoke-PowerBIRestMethod -Method GET -Url $pagesUrl | ConvertFrom-Json
+        foreach ($page in $pages.value) {
+            $renamedPage = Rename-Properties -object $page -renameMap $pageRenameMap
+            $renamedPage | Add-Member -NotePropertyName "WorkspaceId" -NotePropertyValue $workspace.WorkspaceId -Force
+            $renamedPage | Add-Member -NotePropertyName "WorkspaceName" -NotePropertyValue $workspace.WorkspaceName -Force
+            $renamedPage | Add-Member -NotePropertyName "ReportId" -NotePropertyValue $report.id -Force
+            $renamedPage | Add-Member -NotePropertyName "ReportName" -NotePropertyValue $report.name -Force
+            $reportPagesInfo += $renamedPage
+
+            # Store the report ID in the hash set
+            $reportIds[$report.id] = $true
+        }
+    }
+Write-Output "Workspace [$($workspace.WorkspaceName)] Report & Model metadata extraction process completed."
+}
+
+# Fetch Apps and App Reports that are in filtered workspaces
+$appsUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/apps"
+$apps = Invoke-PowerBIRestMethod -Method GET -Url $appsUrl | ConvertFrom-Json
+
+# Create a hash set to store App Report IDs
+$appReportIds = @{}
+$originalReportObjectIds = @{}
+
+foreach ($app in $apps.value) {
+    if ($workspacesInfo.WorkspaceId -contains $app.workspaceId) {
+        $renamedApp = Rename-Properties -object $app -renameMap $appRenameMap
+        $appsInfo += $renamedApp
+
+        # Fetch reports within each app
+        $appReportsUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/apps/$($app.id)/reports"
+        $appReports = Invoke-PowerBIRestMethod -Method GET -Url $appReportsUrl | ConvertFrom-Json
+
+        foreach ($report in $appReports.value) {
+            $renamedAppReport = Rename-Properties -object $report -renameMap $appReportRenameMap
+            $renamedAppReport | Add-Member -NotePropertyName "AppId" -NotePropertyValue $app.id -Force
+            $renamedAppReport | Add-Member -NotePropertyName "AppName" -NotePropertyValue $app.name -Force
+            $reportsInAppInfo += $renamedAppReport
+
+            # Store the app report ID in the hash set
+            $appReportIds[$report.id] = $true
+            $originalReportObjectIds[$report.originalReportObjectId] = $true
+        }
+    }
+}
+
+# Fetch Refresh History for Datasets
+foreach ($workspace in $workspacesInfo) {
+
+Write-Output "Workspace [$($workspace.WorkspaceName)] Model Refresh History extraction process started."
+
+    foreach ($dataset in $datasetsInfo | Where-Object { $_.WorkspaceId -eq $workspace.WorkspaceId }) {
+        $refreshHistoryUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups/$($workspace.WorkspaceId)/datasets/$($dataset.DatasetId)/refreshes"
+        $refreshHistoryResponse = Invoke-PowerBIRestMethod -Method GET -Url $refreshHistoryUrl | ConvertFrom-Json
+
+        foreach ($refresh in $refreshHistoryResponse.value) {
+            $renamedRefreshRecord = Rename-Properties -object $refresh -renameMap $datasetRefreshRenameMap
+            $renamedRefreshRecord | Add-Member -NotePropertyName "WorkspaceId" -NotePropertyValue $workspace.WorkspaceId -Force
+            $renamedRefreshRecord | Add-Member -NotePropertyName "WorkspaceName" -NotePropertyValue $workspace.WorkspaceName -Force
+            $renamedRefreshRecord | Add-Member -NotePropertyName "DatasetId" -NotePropertyValue $dataset.DatasetId -Force
+            $renamedRefreshRecord | Add-Member -NotePropertyName "DatasetName" -NotePropertyValue $dataset.DatasetName -Force
+
+            $datasetRefreshHistory += $renamedRefreshRecord
+        }
+    }
+Write-Output "Workspace [$($workspace.WorkspaceName)] Model Refresh History extraction process completed."
+}  
+
+
+# Fetch Refresh Schedule for Datasets
+foreach ($workspace in $workspacesInfo) {
+
+Write-Output "Workspace [$($workspace.WorkspaceName)] Model Refresh Schedule extraction process started."
+
+    foreach ($dataset in $datasetsInfo | Where-Object { $_.WorkspaceId -eq $workspace.WorkspaceId }) {
+        $refreshScheduleUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups/$($workspace.WorkspaceId)/datasets/$($dataset.DatasetId)/refreshSchedule"
+        
+        try {
+            $refreshScheduleResponse = Invoke-PowerBIRestMethod -Method GET -Url $refreshScheduleUrl | ConvertFrom-Json
+            
+            # Get base properties that apply to all rows
+            $renamedScheduleRecord = Rename-Properties -object $refreshScheduleResponse -renameMap $datasetRefreshScheduleRenameMap
+            
+            # Create separate rows for each day-time combination
+            $days = if ($refreshScheduleResponse.days) { $refreshScheduleResponse.days } else { @($null) }
+            $times = if ($refreshScheduleResponse.times) { $refreshScheduleResponse.times } else { @($null) }
+            
+            foreach ($day in $days) {
+                foreach ($time in $times) {
+                    $scheduleRow = $renamedScheduleRecord.PSObject.Copy()
+                    $scheduleRow | Add-Member -NotePropertyName "WorkspaceId" -NotePropertyValue $workspace.WorkspaceId -Force
+                    $scheduleRow | Add-Member -NotePropertyName "WorkspaceName" -NotePropertyValue $workspace.WorkspaceName -Force
+                    $scheduleRow | Add-Member -NotePropertyName "DatasetId" -NotePropertyValue $dataset.DatasetId -Force
+                    $scheduleRow | Add-Member -NotePropertyName "DatasetName" -NotePropertyValue $dataset.DatasetName -Force
+                    $scheduleRow | Add-Member -NotePropertyName "DatasetRefreshScheduleDay" -NotePropertyValue $day -Force
+                    $scheduleRow | Add-Member -NotePropertyName "DatasetRefreshScheduleTime" -NotePropertyValue $time -Force
+                    
+                    $datasetRefreshSchedule += $scheduleRow
+                }
+            }
+        }
+        catch {
+            # Silently continue if refresh schedule is not available for this dataset
+        }
+    }
+Write-Output "Workspace [$($workspace.WorkspaceName)] Model Refresh Schedule extraction process completed."
+}
+
+
+# Fetch Dataflows for Workspaces
+foreach ($workspace in $workspacesInfo) {
+
+Write-Output "Workspace [$($workspace.WorkspaceName)] Dataflow metadata extraction process started."
+
+    # Fetch Gen 1 and Gen 2 dataflows using Power BI API
+    $dataflowsUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups/$($workspace.WorkspaceId)/dataflows"
+    $dataflowsResponse = Invoke-PowerBIRestMethod -Method GET -Url $dataflowsUrl | ConvertFrom-Json
+
+    # Ensure response is not null before looping
+    if ($dataflowsResponse.value) {
+        foreach ($dataflow in $dataflowsResponse.value) {
+            $renamedDataflow = Rename-Properties -object $dataflow -renameMap $dataflowRenameMap
+            $renamedDataflow | Add-Member -NotePropertyName "WorkspaceId" -NotePropertyValue $workspace.WorkspaceId -Force
+            $renamedDataflow | Add-Member -NotePropertyName "WorkspaceName" -NotePropertyValue $workspace.WorkspaceName -Force
+
+            # Store DataflowId and DataflowName in a lookup table
+            if ($dataflow.objectId) {  
+                $dataflowNameLookup[$dataflow.objectId] = $dataflow.name  
+            }
+
+            $dataflowsInfo += $renamedDataflow
+
+            # Fetch Dataflow Datasources
+            $dataflowSourcesUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups/$($workspace.WorkspaceId)/dataflows/$($dataflow.objectId)/datasources"
+            $dataflowSourcesResponse = Invoke-PowerBIRestMethod -Method GET -Url $dataflowSourcesUrl | ConvertFrom-Json
+
+            # Ensure response is not null before looping
+            if ($dataflowSourcesResponse.value) {
+                foreach ($datasource in $dataflowSourcesResponse.value) {
+                    $renamedDataflowDatasource = Rename-Properties -object $datasource -renameMap $dataflowDatasourceRenameMap
+
+                    # Ensure required fields are included
+                    $renamedDataflowDatasource | Add-Member -NotePropertyName "WorkspaceId" -NotePropertyValue $workspace.WorkspaceId -Force
+                    $renamedDataflowDatasource | Add-Member -NotePropertyName "WorkspaceName" -NotePropertyValue $workspace.WorkspaceName -Force
+                    $renamedDataflowDatasource | Add-Member -NotePropertyName "DataflowId" -NotePropertyValue $dataflow.objectId -Force
+
+            		if ($datasource.connectionDetails) {
+               		 $renamedDataflowDatasource.DataflowDatasourceConnectionDetails = $datasource.connectionDetails | ConvertTo-Json -Compress
+            }
+                    
+
+                    if ($dataflowNameLookup.ContainsKey($dataflow.objectId)) {
+                        $renamedDataflowDatasource | Add-Member -NotePropertyName "DataflowName" -NotePropertyValue $dataflowNameLookup[$dataflow.objectId] -Force
+                    } else {
+                        $renamedDataflowDatasource | Add-Member -NotePropertyName "DataflowName" -NotePropertyValue "Unknown Dataflow" -Force
+                    }
+
+                    # Store in collection
+                    $dataflowSourcesInfo += $renamedDataflowDatasource
+                }
+            }
+        }
+    }
+
+    # Fetch Gen 2 CICD dataflows using Fabric API
+    try {
+        $fabricDataflowsUrl = "$($global:PowerBIEndpoints.FabricApiPrefix)/v1/workspaces/$($workspace.WorkspaceId)/dataflows"
+        $fabricHeaders = @{
+            'Authorization' = "Bearer $(Get-CurrentAccessToken)"
+            'Content-Type' = 'application/json'
+        }
+        $fabricDataflowsResponse = Invoke-RestMethod -Uri $fabricDataflowsUrl -Headers $fabricHeaders -Method GET -ErrorAction Stop
+
+        # Ensure response is not null before looping
+        if ($fabricDataflowsResponse.value) {
+            foreach ($fabricDataflow in $fabricDataflowsResponse.value) {
+                # Map Fabric API response to match Power BI API structure using rename map
+                $renamedFabricDataflow = Rename-Properties -object $fabricDataflow -renameMap $fabricDataflowRenameMap
+                $renamedFabricDataflow | Add-Member -NotePropertyName "WorkspaceId" -NotePropertyValue $workspace.WorkspaceId -Force
+                $renamedFabricDataflow | Add-Member -NotePropertyName "WorkspaceName" -NotePropertyValue $workspace.WorkspaceName -Force
+                $renamedFabricDataflow | Add-Member -NotePropertyName "DataflowGeneration" -NotePropertyValue "Gen 2 CICD" -Force
+                
+                # Store DataflowId and DataflowName in a lookup table
+                if ($fabricDataflow.id) {  
+                    $dataflowNameLookup[$fabricDataflow.id] = $fabricDataflow.displayName  
+                }
+
+                $dataflowsInfo += $renamedFabricDataflow
+            }
+        }
+    }
+    catch {
+        # Silently continue if Fabric API is not available or returns an error
+        # This allows the script to work in environments without Fabric API access
+    }
+
+Write-Output "Workspace [$($workspace.WorkspaceName)] Dataflow metadata extraction process completed."
+} 
+
+
+# Fetch Dataflow Lineage (Upstream Dataflows)
+foreach ($workspace in $workspacesInfo) {
+
+        $dataflowLineageUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups/$($workspace.WorkspaceId)/datasets/upstreamDataflows"
+        $dataflowLineageResponse = Invoke-PowerBIRestMethod -Method GET -Url $dataflowLineageUrl | ConvertFrom-Json
+
+        # Ensure response is not null before looping
+        if ($dataflowLineageResponse.value) {
+            foreach ($dataflow in $dataflowLineageResponse.value) {
+                $renamedDataflow = Rename-Properties -object $dataflow -renameMap $dataflowLineageRenameMap
+                $renamedDataflow | Add-Member -NotePropertyName "WorkspaceId" -NotePropertyValue $workspace.WorkspaceId -Force
+                $renamedDataflow | Add-Member -NotePropertyName "WorkspaceName" -NotePropertyValue $workspace.WorkspaceName -Force
+
+
+                $dataflowId = $dataflow.dataflowObjectId  
+                if ($dataflowId -and $dataflowNameLookup.ContainsKey($dataflowId)) {
+                    $renamedDataflow | Add-Member -NotePropertyName "DataflowName" -NotePropertyValue $dataflowNameLookup[$dataflowId] -Force
+                } else {
+                    $renamedDataflow | Add-Member -NotePropertyName "DataflowName" -NotePropertyValue "Unknown Dataflow" -Force
+                }
+
+            $datasetId = $dataflow.datasetObjectId  
+            if ($datasetId -and $datasetNameLookup.ContainsKey($datasetId)) {
+                $renamedDataflow | Add-Member -NotePropertyName "DatasetName" -NotePropertyValue $datasetNameLookup[$datasetId] -Force
+            } else {
+                $renamedDataflow | Add-Member -NotePropertyName "DatasetName" -NotePropertyValue "Unknown Dataset" -Force
+            }
+
+                $dataflowLineage += $renamedDataflow
+            }
+        }
+    }
+
+# Fetch Dataflow Refresh History
+foreach ($workspace in $workspacesInfo) {
+Write-Output "Workspace [$($workspace.WorkspaceName)] Dataflow Refresh History extraction process started."
+    foreach ($dataflow in $dataflowsInfo | Where-Object { $_.WorkspaceId -eq $workspace.WorkspaceId }) {
+        $refreshHistoryUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups/$($workspace.WorkspaceId)/dataflows/$($dataflow.DataflowId)/transactions"
+        $refreshHistoryResponse = Invoke-PowerBIRestMethod -Method GET -Url $refreshHistoryUrl | ConvertFrom-Json
+
+        # Ensure response is not null before looping
+        if ($refreshHistoryResponse.value) {
+            foreach ($refresh in $refreshHistoryResponse.value) {
+                $renamedRefreshRecord = Rename-Properties -object $refresh -renameMap $dataflowRefreshRenameMap
+                $renamedRefreshRecord | Add-Member -NotePropertyName "WorkspaceId" -NotePropertyValue $workspace.WorkspaceId -Force
+                $renamedRefreshRecord | Add-Member -NotePropertyName "WorkspaceName" -NotePropertyValue $workspace.WorkspaceName -Force
+                $renamedRefreshRecord | Add-Member -NotePropertyName "DataflowId" -NotePropertyValue $dataflow.DataflowId -Force
+                
+
+                if ($dataflowNameLookup.ContainsKey($dataflow.DataflowId)) {
+                    $renamedRefreshRecord | Add-Member -NotePropertyName "DataflowName" -NotePropertyValue $dataflowNameLookup[$dataflow.DataflowId] -Force
+                } else {
+                    $renamedRefreshRecord | Add-Member -NotePropertyName "DataflowName" -NotePropertyValue "Unknown Dataflow" -Force
+                }
+
+                # Store in collection
+                $dataflowRefreshHistory += $renamedRefreshRecord
+            }
+        }
+    }
+Write-Output "Workspace [$($workspace.WorkspaceName)] Dataflow Refresh History extraction process completed."
+}
+
+# Loop through all workspaces to fetch Fabric Items (excluding Reports and Semantic Models)
+foreach ($workspace in $workspacesInfo) {
+
+Write-Output "Workspace [$($workspace.WorkspaceName)] Fabric Item metadata extraction process started."
+
+    $workspaceId = $workspace.WorkspaceId
+    $workspaceName = $workspace.WorkspaceName
+    $fabricItemsUrl = "$($global:PowerBIEndpoints.FabricApiPrefix)/v1/workspaces/$workspaceId/items"
+
+    try {
+        $fabricItemsResponse = Invoke-PowerBIRestMethod -Method GET -Url $fabricItemsUrl | ConvertFrom-Json
+
+
+        $filteredItems = $fabricItemsResponse.value | Where-Object {
+            $_.type -ne 'Report' -and $_.type -ne 'SemanticModel'
+        }
+
+        foreach ($item in $filteredItems) {
+            $renamedItem = Rename-Properties -object $item -renameMap $fabricItemsRenameMap
+            $renamedItem | Add-Member -NotePropertyName "WorkspaceId" -NotePropertyValue $workspaceId -Force
+            $renamedItem | Add-Member -NotePropertyName "WorkspaceName" -NotePropertyValue $workspaceName -Force
+
+            $fabricItemsInfo += $renamedItem
+        }
+    } catch {
+        Write-Warning "Failed to fetch Fabric items for Workspace ID: $workspaceId. $_"
+    }
+
+Write-Output "Workspace [$($workspace.WorkspaceName)] Fabric Item metdadata extraction process completed."
+
+}
+
+
+
+
+
+
+Write-Output "My Workspace Metadata Extract Process Started"
+
+
+#### Start of 'My Workspace' detail extract ####
+
+if ($IncludeMyWorkspace -or ($selection -and $selection.TimedOut)) {
+
+    # Define "My Workspace" constants
+    $myWorkspaceId = "My Workspace"
+    $myWorkspaceName = "My Workspace"
+
+    # Manually add "My Workspace" breakdown to workspacesInfo
+    $myWorkspaceDetails = [PSCustomObject]@{
+        WorkspaceId                      = $myWorkspaceId
+        WorkspaceName                    = $myWorkspaceName
+        WorkspaceType                    = "Workspace"
+        WorkspaceIsReadOnly              = $false
+        WorkspaceIsOnDedicatedCapacity   = $false
+    }
+    $workspacesInfo += $myWorkspaceDetails
+
+    # Fetch datasets from "My Workspace"
+    $myWorkspaceDatasetsUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/datasets"
+    $myWorkspaceDatasets = Invoke-PowerBIRestMethod -Method GET -Url $myWorkspaceDatasetsUrl | ConvertFrom-Json
+    foreach ($dataset in $myWorkspaceDatasets.value) {
+        $renamedDataset = Rename-Properties -object $dataset -renameMap $datasetRenameMap
+        $renamedDataset | Add-Member -NotePropertyName "WorkspaceId" -NotePropertyValue $myWorkspaceId -Force
+        $renamedDataset | Add-Member -NotePropertyName "WorkspaceName" -NotePropertyValue $myWorkspaceName -Force
+        $datasetNameLookup[$dataset.id] = $dataset.name
+        $datasetsInfo += $renamedDataset
+
+        $datasourcesUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/datasets/$($dataset.id)/datasources"
+        $datasources = Invoke-PowerBIRestMethod -Method GET -Url $datasourcesUrl | ConvertFrom-Json
+        foreach ($datasource in $datasources.value) {
+            $renamedDatasource = Rename-Properties -object $datasource -renameMap $datasetDatasourceRenameMap
+            $renamedDatasource | Add-Member -NotePropertyName "WorkspaceId" -NotePropertyValue $myWorkspaceId -Force
+            $renamedDatasource | Add-Member -NotePropertyName "WorkspaceName" -NotePropertyValue $myWorkspaceName -Force
+            $renamedDatasource | Add-Member -NotePropertyName "DatasetId" -NotePropertyValue $dataset.id -Force
+            $renamedDatasource | Add-Member -NotePropertyName "DatasetName" -NotePropertyValue $dataset.name -Force
+            if ($datasource.connectionDetails) {
+                $renamedDatasource.DatasetDatasourceConnectionDetails = $datasource.connectionDetails | ConvertTo-Json -Compress
+            }
+            $datasetSourcesInfo += $renamedDatasource
+        }
+    }
+
+    # Fetch reports from "My Workspace"
+    $myWorkspaceReportsUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/reports"
+    $myWorkspaceReports = Invoke-PowerBIRestMethod -Method GET -Url $myWorkspaceReportsUrl | ConvertFrom-Json
+
+    $sharedReportExists = $false
+    foreach ($report in $myWorkspaceReports.value) {
+        # Skip if already captured elsewhere (workspace/app)
+        if ($appReportIds.ContainsKey($report.id) -or $reportIds.ContainsKey($report.id) -or $originalReportObjectIds.ContainsKey($report.id)) {
+            continue
+        }
+        
+        # Skip reports with appId - these are shared via apps, not actually in My Workspace
+        if ($report.appId) {
+            continue
+        }
+
+        if ($report.isOwnedByMe -eq $false) {
+            $workspaceIdValue = "Shared Reports (No Workspace Access)"
+            $workspaceNameValue = "Shared Reports (No Workspace Access)"
+            $sharedReportExists = $true
+        } else {
+            $workspaceIdValue = $myWorkspaceId
+            $workspaceNameValue = $myWorkspaceName
+        }
+
+        $renamedReport = Rename-Properties -object $report -renameMap $reportRenameMap
+        $renamedReport | Add-Member -NotePropertyName "WorkspaceId" -NotePropertyValue $workspaceIdValue -Force
+        $renamedReport | Add-Member -NotePropertyName "WorkspaceName" -NotePropertyValue $workspaceNameValue -Force
+
+        $datasetId = $report.datasetId
+        if ($datasetId -and $datasetNameLookup.ContainsKey($datasetId)) {
+            $renamedReport | Add-Member -NotePropertyName "DatasetName" -NotePropertyValue $datasetNameLookup[$datasetId] -Force
+        } else {
+            $renamedReport | Add-Member -NotePropertyName "DatasetName" -NotePropertyValue "Unknown Dataset" -Force
+        }
+        $reportsInfo += $renamedReport
+
+        $pagesUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/reports/$($report.id)/pages"
+        $pages = Invoke-PowerBIRestMethod -Method GET -Url $pagesUrl | ConvertFrom-Json
+        foreach ($page in $pages.value) {
+            $renamedPage = Rename-Properties -object $page -renameMap $pageRenameMap
+            $renamedPage | Add-Member -NotePropertyName "WorkspaceId" -NotePropertyValue $workspaceIdValue -Force
+            $renamedPage | Add-Member -NotePropertyName "WorkspaceName" -NotePropertyValue $workspaceNameValue -Force
+            $renamedPage | Add-Member -NotePropertyValue "ReportId" -NotePropertyValue $report.id -Force
+            $renamedPage | Add-Member -NotePropertyValue "ReportName" -NotePropertyValue $report.name -Force
+            $reportPagesInfo += $renamedPage
+        }
+    }
+
+    if ($sharedReportExists) {
+        $sharedWorkspaceDetails = [PSCustomObject]@{
+            WorkspaceId                    = "Shared Reports (No Workspace Access)"
+            WorkspaceName                  = "Shared Reports (No Workspace Access)"
+            WorkspaceType                  = "Workspace"
+            WorkspaceIsReadOnly            = $false
+            WorkspaceIsOnDedicatedCapacity = $false
+        }
+        $workspacesInfo += $sharedWorkspaceDetails
+    }
+
+    # Dataset refresh history for My Workspace
+    foreach ($dataset in $datasetsInfo | Where-Object { $_.WorkspaceId -eq $myWorkspaceId }) {
+        $refreshHistoryUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/datasets/$($dataset.DatasetId)/refreshes"
+        $refreshHistoryResponse = Invoke-PowerBIRestMethod -Method GET -Url $refreshHistoryUrl | ConvertFrom-Json
+        foreach ($refresh in $refreshHistoryResponse.value) {
+            $renamedRefreshRecord = Rename-Properties -object $refresh -renameMap $datasetRefreshRenameMap
+            $renamedRefreshRecord | Add-Member -NotePropertyName "WorkspaceId" -NotePropertyValue $myWorkspaceId -Force
+            $renamedRefreshRecord | Add-Member -NotePropertyName "WorkspaceName" -NotePropertyValue $myWorkspaceName -Force
+            $renamedRefreshRecord | Add-Member -NotePropertyName "DatasetId" -NotePropertyValue $dataset.DatasetId -Force
+            $renamedRefreshRecord | Add-Member -NotePropertyName "DatasetName" -NotePropertyValue $dataset.DatasetName -Force
+            $datasetRefreshHistory += $renamedRefreshRecord
+        }
+    }
+
+    # Dataset refresh schedule for My Workspace
+    foreach ($dataset in $datasetsInfo | Where-Object { $_.WorkspaceId -eq $myWorkspaceId }) {
+        $refreshScheduleUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/datasets/$($dataset.DatasetId)/refreshSchedule"
+        
+        try {
+            $refreshScheduleResponse = Invoke-PowerBIRestMethod -Method GET -Url $refreshScheduleUrl | ConvertFrom-Json
+            
+            # Get base properties that apply to all rows
+            $renamedScheduleRecord = Rename-Properties -object $refreshScheduleResponse -renameMap $datasetRefreshScheduleRenameMap
+            
+            # Create separate rows for each day-time combination
+            $days = if ($refreshScheduleResponse.days) { $refreshScheduleResponse.days } else { @($null) }
+            $times = if ($refreshScheduleResponse.times) { $refreshScheduleResponse.times } else { @($null) }
+            
+            foreach ($day in $days) {
+                foreach ($time in $times) {
+                    $scheduleRow = $renamedScheduleRecord.PSObject.Copy()
+                    $scheduleRow | Add-Member -NotePropertyName "WorkspaceId" -NotePropertyValue $myWorkspaceId -Force
+                    $scheduleRow | Add-Member -NotePropertyName "WorkspaceName" -NotePropertyValue $myWorkspaceName -Force
+                    $scheduleRow | Add-Member -NotePropertyName "DatasetId" -NotePropertyValue $dataset.DatasetId -Force
+                    $scheduleRow | Add-Member -NotePropertyName "DatasetName" -NotePropertyValue $dataset.DatasetName -Force
+                    $scheduleRow | Add-Member -NotePropertyName "DatasetRefreshScheduleDay" -NotePropertyValue $day -Force
+                    $scheduleRow | Add-Member -NotePropertyName "DatasetRefreshScheduleTime" -NotePropertyValue $time -Force
+                    
+                    $datasetRefreshSchedule += $scheduleRow
+                }
+            }
+        }
+        catch {
+            # Silently continue if refresh schedule is not available for this dataset
+        }
+    }
+
+} else {
+    Write-Host "Skipping 'My Workspace' (user did not select it and no timeout)."
+}
+    
+Write-Output "My Workspace Metadata Extract Process Completed"
+
+
+# Export all collections to Excel
+if (Test-Path $excelFile) {
+    Remove-Item $excelFile -Force
+}
+
+$workspacesInfo | Export-Excel -Path $excelFile -WorksheetName "Workspaces" -AutoSize
+$fabricItemsInfo | Export-Excel -Path $excelFile -WorksheetName "FabricItems" -AutoSize -Append
+$datasetsInfo | Export-Excel -Path $excelFile -WorksheetName "Datasets" -AutoSize -Append
+$datasetSourcesInfo | Export-Excel -Path $excelFile -WorksheetName "DatasetSourcesInfo" -AutoSize -Append
+$datasetRefreshHistory | Export-Excel -Path $excelFile -WorksheetName "DatasetRefreshHistory" -AutoSize -Append
+$datasetRefreshSchedule | Export-Excel -Path $excelFile -WorksheetName "DatasetRefreshSchedule" -AutoSize -Append
+$dataflowsInfo | Export-Excel -Path $excelFile -WorksheetName "Dataflows" -AutoSize -Append
+$dataflowLineage | Export-Excel -Path $excelFile -WorksheetName "DataflowLineage" -AutoSize -Append
+$dataflowSourcesInfo | Export-Excel -Path $excelFile -WorksheetName "DataflowSourcesInfo" -AutoSize -Append
+$dataflowRefreshHistory | Export-Excel -Path $excelFile -WorksheetName "DataflowRefreshHistory" -AutoSize -Append
+$reportsInfo | Export-Excel -Path $excelFile -WorksheetName "Reports" -AutoSize -Append
+$reportPagesInfo | Export-Excel -Path $excelFile -WorksheetName "ReportPages" -AutoSize -Append
+$appsInfo | Export-Excel -Path $excelFile -WorksheetName "Apps" -AutoSize -Append
+$reportsInAppInfo | Export-Excel -Path $excelFile -WorksheetName "AppReports" -AutoSize -Append
+
+Write-Host "Export completed. Data is saved to $excelFile"  
+
+Write-Output "Power BI Environment Detail Extract Process Completed. Excel output saved to $excelFile"
+
+
+
+
+
+
+
+#### Start of Model Backup ####
+
+
+
+
+
+
+
+
+Write-Output "Model Backup Process Started"
+
+# Construct the folder path and create it if it doesn't exist (only once, before the loop)
+$modelBackupsPath = "$baseFolderPath\Model Backups"
+if (-not (Test-Path $modelBackupsPath)) {
+    New-Item -ItemType Directory -Force -Path $modelBackupsPath | Out-Null
+}
+
+# Construct the date model backup folder path (clear if it already exists, only once)
+$folderPath = "$modelBackupsPath\$date"
+if (Test-Path $folderPath) {
+    Write-Host "[INFO] Clearing existing model backup folder for today: $folderPath"
+    Remove-Item -Path $folderPath -Recurse -Force -ErrorAction SilentlyContinue
+}
+New-Item -ItemType Directory -Force -Path $folderPath | Out-Null
+
+# Loop through datasetsInfo collection to perform model export
+foreach ($dataset in $datasetsInfo) {
+    # Get workspace details
+    $workspace = $workspacesInfo | Where-Object { $_.WorkspaceId -eq $dataset.WorkspaceId }
+
+    # Check if the workspace is Premium or Fabric capacity before proceeding
+    if ($workspace.WorkspaceIsOnDedicatedCapacity -eq $true) {
+
+        $workspaceName = $dataset.WorkspaceName -replace '\[', '%5B' -replace '\]', '%5D' -replace ' ', '%20'
+        $datasetId = $dataset.DatasetId
+        $datasetName = $dataset.DatasetName
+
+        # Clean up workspace name
+        $cleanDatasetWorkspaceName = $dataset.WorkspaceName -replace '\[', '(' -replace '\]', ')'
+        $cleanDatasetWorkspaceName = $cleanDatasetWorkspaceName -replace "[^a-zA-Z0-9\(\)&,.-]", " "
+        $cleanDatasetWorkspaceName = $cleanDatasetWorkspaceName.TrimStart()
+
+        # Clean up dataset name
+        $cleanDatasetName = $datasetName -replace '\[', '(' -replace '\]', ')'
+        $cleanDatasetName = $cleanDatasetName -replace "[^a-zA-Z0-9\(\)&,.-]", " "
+        $cleanDatasetName = $cleanDatasetName.TrimStart()
+
+        # Define the new model database name
+        $newModelDatabaseName = "$cleanDatasetWorkspaceName ~ $cleanDatasetName"
+
+        # Create the C# script to rename the Model.Database.Name
+        $csharpScript = @"
+Model.Database.Name = `"$newModelDatabaseName`";
+"@
+
+        # Save the C# script to a temporary file	
+	$tempScriptPath = Join-Path $env:TEMP "TabularEditor_RenameModel.cs"
+	Set-Content -Path $tempScriptPath -Value $csharpScript -Encoding UTF8
+
+
+        # Construct the argument list for the model export with renaming
+        $modelExportArgs = "`"Provider=MSOLAP;Data Source=$($global:PowerBIEndpoints.XmlaPrefix)/v1.0/myorg/$workspaceName;Password=$(Get-CurrentAccessToken)`" `"$datasetName`" -S `"$tempScriptPath`" -B `"$folderPath\$cleanDatasetWorkspaceName ~ $cleanDatasetName.bim`""
+        
+        # Start the Tabular Editor process for model export and renaming
+		Write-Host "**Exporting $cleanDatasetWorkspaceName ~ $cleanDatasetName**"
+        Start-Process -FilePath "$TabularEditor2Path" -Wait -NoNewWindow -ArgumentList $modelExportArgs
+
+        # Clean up the temporary script file
+        Remove-Item -Path $tempScriptPath
+    }
+}
+
+Write-Output "Model Backup Process Completed"
+
+
+
+
+
+
+
+#### Start of Report Backup ####
+
+
+
+
+
+
+
+Write-Output "Report Backup Process Started"
+
+# Define the report backups path
+$reportBackupsPath = Join-Path -Path $baseFolderPath -ChildPath "Report Backups"
+
+# Check if the base folder exists, if not create it
+if (-not (Test-Path -Path $baseFolderPath)) {
+    New-Item -Path $baseFolderPath -ItemType Directory -Force | Out-Null
+}
+
+# Check if the "Report Backups" folder exists, if not create it
+if (-not (Test-Path -Path $reportBackupsPath)) {
+    New-Item -Path $reportBackupsPath -ItemType Directory -Force | Out-Null
+}
+
+# Create a new sub folder for the date (clear if it already exists)
+$newDateFolder = Join-Path -Path $reportBackupsPath -ChildPath $date
+if (Test-Path -Path $newDateFolder) {
+    Write-Host "[INFO] Clearing existing report backup folder for today: $newDateFolder"
+    Remove-Item -Path $newDateFolder -Recurse -Force -ErrorAction SilentlyContinue
+}
+New-Item -Path $newDateFolder -ItemType Directory -Force | Out-Null
+
+# Define the temporary extraction folder
+$tempExtractFolder = "$baseFolderPath\Config\Temp"
+
+# Check if the temp extract folder exists, if not create it
+if (-not (Test-Path -Path $tempExtractFolder)) {
+    New-Item -Path $tempExtractFolder -ItemType Directory -Force | Out-Null
+}
+
+# Function to Export Using REST API and Stored Token
+function Export-ReportUsingAPI {
+    param (
+        [string]$GroupId,
+        [string]$ReportId,
+        [string]$OutFilePath,
+        [string]$DownloadType
+    )
+
+    $accessToken = Get-CurrentAccessToken
+    $apiUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups/$GroupId/reports/$ReportId/Export?downloadType=$DownloadType"
+
+    try {
+        Invoke-RestMethod -Uri $apiUrl `
+            -Headers @{ Authorization = "Bearer $accessToken" } `
+            -Method GET `
+            -OutFile $OutFilePath
+    } catch {
+        
+    }
+}
+
+	# -------------------
+	# Helper Function(s)
+	# -------------------
+	
+	# Function: get first free drive letter (Z down to D)
+	function Get-FreeDriveLetter {
+	    $used = Get-PSDrive -PSProvider FileSystem | ForEach-Object { $_.Name }
+	    foreach ($letter in [char[]](90..68)) {  # Z..Y..X.. down to D
+	        if ($used -notcontains $letter) { return "${letter}:" }
+	    }
+	    throw "No free drive letters available."
+	}
+
+	foreach ($workspace in $workspacesInfo) {
+	    $workspaceName = $workspace.WorkspaceName
+	    $workspaceId = $workspace.WorkspaceId
+	
+	    # Clean up workspace name
+	    $cleanWorkspaceName = $workspaceName -replace '\[', '(' -replace '\]', ')'
+	    $cleanWorkspaceName = $cleanWorkspaceName -replace "[^a-zA-Z0-9\(\)&,.-]", " "
+	    $cleanWorkspaceName = $cleanWorkspaceName.TrimStart()
+	
+	    # Fetch reports from the existing list
+	    $reports = $reportsInfo | Where-Object { $_.WorkspaceId -eq $workspaceId }
+	
+	    foreach ($report in $reports) {
+	        $reportName = $report.ReportName
+	        $reportId = $report.ReportId
+	
+	        # Clean up report name
+	        $cleanReportName = $reportName -replace '\[', '(' -replace '\]', ')'
+	        $cleanReportName = $cleanReportName -replace "[^a-zA-Z0-9\(\)&,.-]", " "
+	        $cleanReportName = $cleanReportName.TrimStart()
+	
+	        # Determine file extension
+	        $fileExtension = if ($report.WebUrl -like "*/rdlreports/*") { "rdl" } else { "pbix" }
+	        $filename = "$cleanWorkspaceName ~ $cleanReportName.$fileExtension"
+	        $filepath = Join-Path -Path $newDateFolder -ChildPath $filename
+	        $extractFolder = Join-Path -Path $tempExtractFolder -ChildPath "$cleanWorkspaceName ~ $cleanReportName"
+	
+	        # Delete file if it already exists
+	        if (Test-Path $filepath) {
+	            Remove-Item $filepath -Force
+	        }
+	
+	        Write-Host "Exporting $cleanWorkspaceName ~ $cleanReportName"
+	
+	        # Export based on Workspace Type
+	        if ($workspace.WorkspaceIsOnDedicatedCapacity -eq $false) {
+	            # Pro Workspace → IncludeModel
+	            Export-ReportUsingAPI -GroupId $workspaceId -ReportId $reportId -OutFilePath $filepath -DownloadType "IncludeModel"
+	        } else {
+	            # Premium/Fabric Workspace → LiveConnect
+	            Export-ReportUsingAPI -GroupId $workspaceId -ReportId $reportId -OutFilePath $filepath -DownloadType "LiveConnect"
+	        }
+			
+		# Only process model extraction for Pro Workspaces
+		if ($workspace.WorkspaceIsOnDedicatedCapacity -eq $false) {
+		    Write-Host "Extracting $cleanWorkspaceName ~ $cleanReportName"
+		
+		    $driveLetter = Get-FreeDriveLetter
+		    $quotedExtractFolder = "`"$extractFolder`""
+		
+		    # ✅ Make sure the extract folder exists before subst
+		    if (-not (Test-Path $extractFolder)) {
+		        New-Item -ItemType Directory -Path $extractFolder -Force | Out-Null
+		    }
+		
+		    if (Test-Path $driveLetter) { subst $driveLetter /D }
+		
+		    $substCommand = "subst $driveLetter $quotedExtractFolder"
+		    cmd.exe /c $substCommand
+		
+		    if (-not (Test-Path $driveLetter)) {
+		        Write-Error "Failed to map $extractFolder to $driveLetter"
+		        continue
+		    }
+		
+		    try {
+		        # Extract into subst drive
+				Write-Host "If available, extracting Model from $cleanWorkspaceName ~ $cleanReportName"
+		        & $pbiToolsPath extract $filepath -extractFolder $driveLetter -modelSerialization Raw *> $null
+		
+		        & $pbiToolsPath generate-bim $driveLetter -transforms RemovePBIDataSourceVersion *> $null
+		
+		        $bimFilesGenerated = Get-ChildItem -Path $extractFolder -Filter *.bim
+		        foreach ($bimFile in $bimFilesGenerated) {
+		            $newBimName = "$cleanWorkspaceName ~ $cleanReportName.bim"
+		            $newBimPath = Join-Path -Path $tempExtractFolder -ChildPath $newBimName
+		
+		            Move-Item -Path $bimFile.FullName -Destination $newBimPath -Force
+		        }
+		    }
+		    finally {
+		        # ✅ Always clean up subst drive, even if extract/generate fails
+		        subst $driveLetter /D 2>$null
+		    }
+		}
+	}
+}
+
+# --- Process and Move .bim files ---
+# Path to Tabular Editor executable
+$TabularEditor2Path = "$baseFolderPath\Config\TabularEditor\TabularEditor.exe"
+
+$bimFiles = Get-ChildItem -Path $tempExtractFolder -Recurse -Filter *.bim
+foreach ($bimFile in $bimFiles) {
+    $fileName = [System.IO.Path]::GetFileNameWithoutExtension($bimFile.Name)
+
+    # Build temporary C# script
+    $csharpScript = @"
+Model.Database.Name = "$fileName";
+Model.Database.ID = "$fileName";
+"@
+
+    # Save script to temp
+    $tempScriptPath = Join-Path $env:TEMP "TabularEditor_RenameProModel.cs"
+    Set-Content -Path $tempScriptPath -Value $csharpScript -Encoding UTF8
+
+    # Run Tabular Editor CLI to update BIM
+    $args = "`"$($bimFile.FullName)`" -S `"$tempScriptPath`" -B `"$($bimFile.FullName)`""
+    Start-Process -FilePath $TabularEditor2Path -Wait -NoNewWindow -ArgumentList $args
+
+    # Remove temp script
+    Remove-Item -Path $tempScriptPath -Force
+
+    # Move updated BIM to backup folder
+    $destinationPath = Join-Path -Path $folderPath -ChildPath $bimFile.Name
+    Move-Item -Path $bimFile.FullName -Destination $destinationPath -Force
+
+}
+
+# --- Cleanup Temporary Folders ---
+$tempDestinationRemovalPath = "$baseFolderPath\Config"
+
+Remove-Item -Path "$tempDestinationRemovalPath\Temp" -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item -Path "$tempDestinationRemovalPath\localhost" -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item -Path "$baseFolderPath\localhost" -Recurse -Force -ErrorAction SilentlyContinue
+
+Write-Output "Report Backup Process Completed"
+
+
+
+
+
+
+
+#### Start of Tabular Editor Report Detail (Visual Object Layer) Extract ####
+
+
+
+
+
+
+
+Write-Output "Report Detail Extraction Process Started"
+
+# Start Tabular Editor process 1
+$p = Start-Process -FilePath "$TabularEditor2Path" -Wait -NoNewWindow -WorkingDirectory $baseFolderPath -ArgumentList "`"$baseFolderPath\Config\Blank Model.bim`" -S `"$Script1Path`""
+
+# Start Tabular Editor process 2
+$p = Start-Process -FilePath "$TabularEditor2Path" -Wait -NoNewWindow -WorkingDirectory $baseFolderPath -ArgumentList "`"$baseFolderPath\Config\Blank Model.bim`" -S `"$Script2Path`""
+
+# Define the output Excel file path in the parent folder
+$outputExcelFile = Join-Path -Path $baseFolderPath -ChildPath "Report Detail.xlsx"
+
+# Check if the Excel file already exists and delete it if it does
+if (Test-Path -Path $outputExcelFile) {
+    Remove-Item $outputExcelFile -Force
+    $excelExists = $false
+} else {
+    $excelExists = $false
+}
+
+# Get the latest folder by date
+$latestDateFolder = Get-ChildItem -Path $reportBackupsPath -Directory |
+    Where-Object { $_.Name -match '^\d{4}-\d{2}-\d{2}$' } |  # Filter for folders with a date pattern
+    Sort-Object { [datetime]::Parse($_.Name) } -Descending | # Sort by date, descending
+    Select-Object -First 1
+
+if ($latestDateFolder) {
+    $newDateFolder = $latestDateFolder.FullName
+    Write-Host "Using the latest dated folder: $newDateFolder"
+} else {
+    Write-Error "No valid dated folders found in 'Report Backups'."
+}
+
+foreach ($txtFile in (Get-ChildItem -Path $newDateFolder -Filter *.txt)) {
+    $worksheetName = [System.IO.Path]::GetFileNameWithoutExtension($txtFile.FullName)
+    
+    # Read raw lines without automatically trimming leading or trailing spaces
+    $lines = Get-Content -Path $txtFile.FullName -Encoding UTF8
+    
+    if ($lines.Count -eq 0) { continue }
+    
+    $headers = $lines[0] -split "`t"
+    $data = $lines[1..($lines.Count - 1)] | ForEach-Object {
+        $values = $_ -split "`t", $headers.Count  # Split into exact number of columns as headers
+        $obj = @{}
+        for ($i = 0; $i -lt $headers.Length; $i++) {
+            # Handle cases where there might be fewer values than headers
+            $obj[$headers[$i]] = if ($i -lt $values.Count) { $values[$i] } else { $null }
+        }
+        [PSCustomObject]$obj
+    }
+
+    if ($excelExists) {
+        $data | Export-Excel -Path $outputExcelFile -WorksheetName $worksheetName -AutoNameRange -Append
+    } else {
+        $data | Export-Excel -Path $outputExcelFile -WorksheetName $worksheetName -AutoNameRange
+        $excelExists = $true
+    }
+}
+
+
+
+Write-Host "TXT files appended to $outputExcelFile"
+
+
+
+#### Cleanup Visual Object folders Remaining ####
+
+
+# Check if the any remaining VOL folders exists
+if (Test-Path -Path $newDateFolder) {
+    # Get all subfolders
+    $subfolders = Get-ChildItem -Path $newDateFolder -Directory
+
+    foreach ($subfolder in $subfolders) {
+        Remove-Item -Path $subfolder.FullName -Recurse -Force
+    }
+
+    Write-Host "Additional Subfolders in $newDateFolder deleted"
+} else {
+    Write-Host "Additional Subfolders in $newDateFolder do not exist"
+}
+
+Write-Output "Report Detail Extraction Process Completed. Excel output saved to $outputExcelFile"
+
+
+
+
+
+
+
+
+#### Start of Model Detail Script Run with Script3Path ####
+
+
+
+
+
+
+
+Write-Output "Model Detail Extraction Process Started"
+
+$latestModelDateFolder = Get-ChildItem -Path $modelBackupsPath -Directory |
+    Where-Object { $_.Name -match '^\d{4}-\d{2}-\d{2}$' } |  # Filter for folders with a date pattern
+    Sort-Object { [datetime]::Parse($_.Name) } -Descending | # Sort by date, descending
+    Select-Object -First 1
+
+if ($latestModelDateFolder) {
+    # Override $folderPath with the latest-dated folder
+    $folderPath = $latestModelDateFolder.FullName
+    Write-Host "Using the latest dated folder: $folderPath"
+} else {
+    # Throw an error if no valid dated folders are found
+    Write-Error "No valid dated folders found in 'Model Backups'."
+}
+
+# Check if there are any .bim files in the $folderPath
+$folderPathBimFiles = Get-ChildItem -Path $folderPath -Filter *.bim
+if ($folderPathBimFiles.Count -eq 0) {
+    $sourceFolderPath = $newDateFolder
+} else {
+    $sourceFolderPath = $folderPath
+}
+
+
+# Loop through datasetsInfo collection to run the first model script
+foreach ($dataset in $datasetsInfo) {
+    $workspaceName = $dataset.WorkspaceName
+    $datasetName = $dataset.DatasetName
+
+    # Clean up workspace name
+    $cleanDatasetWorkspaceName = $workspaceName -replace '\[', '(' -replace '\]', ')'
+    $cleanDatasetWorkspaceName = $cleanDatasetWorkspaceName -replace "[^a-zA-Z0-9\(\)&,.-]", " "
+    $cleanDatasetWorkspaceName = $cleanDatasetWorkspaceName.TrimStart()
+
+    # Clean up dataset name
+    $cleanDatasetName = $datasetName -replace '\[', '(' -replace '\]', ')'
+    $cleanDatasetName = $cleanDatasetName -replace "[^a-zA-Z0-9\(\)&,.-]", " "
+    $cleanDatasetName = $cleanDatasetName.TrimStart()
+
+    # Construct the argument list for the first model script run
+    $modelScriptArgs = "`"$sourceFolderPath\$cleanDatasetWorkspaceName ~ $cleanDatasetName.bim`" -S `"$Script3Path`""
+    
+    # Start the Tabular Editor process to run the first model script
+	Write-Host "**Extracting Model Detail for $cleanDatasetWorkspaceName ~ $cleanDatasetName**"
+    Start-Process -FilePath "$TabularEditor2Path" -WorkingDirectory $baseFolderPath -Wait -NoNewWindow -ArgumentList $modelScriptArgs
+}
+
+Write-Host "First model export and script run completed."
+
+
+#### Start of PowerShell Combining to Semantic Models Worksheet ####
+
+
+
+# Define the output Excel file path in the base folder
+$outputExcelFile = Join-Path -Path $baseFolderPath -ChildPath "Model Detail.xlsx"
+
+# Check if the Excel file already exists and delete it if it does
+if (Test-Path -Path $outputExcelFile) {
+    Remove-Item $outputExcelFile -Force
+}
+
+# Initialize an empty array to store all CSV data for Semantic Models
+$semanticModelsCsvData = @()
+
+foreach ($csvFile in (Get-ChildItem -Path $folderPath -Filter *.csv)) {
+    # Exclude files that end with "_MD.csv" for Semantic Models
+    if ($csvFile.Name -notlike "*_MD.csv") {
+        # Import the CSV file
+        $csvData = Import-Csv -Path $csvFile.FullName
+
+        # Append the data to the array
+        $semanticModelsCsvData += $csvData
+    }
+}
+
+# Create a new Excel file with the data in the "Semantic Models" worksheet
+$semanticModelsCsvData | Export-Excel -Path $outputExcelFile -WorksheetName "Semantic Models" -AutoNameRange
+
+Write-Host "CSV files combined into the 'Semantic Models' worksheet in $outputExcelFile"
+Write-Output "Model Detail Extraction Process Completed"
+
+
+
+#### Start of Model Detail Script Run with Script4Path ####
+
+
+
+Write-Output "Measure Dependency Detail Extraction Process Started"
+
+# Loop through datasetsInfo collection to run the second model script
+foreach ($dataset in $datasetsInfo) {
+    $workspaceName = $dataset.WorkspaceName
+    $datasetName = $dataset.DatasetName
+
+    # Clean up workspace name
+    $cleanDatasetWorkspaceName = $workspaceName -replace '\[', '(' -replace '\]', ')'
+    $cleanDatasetWorkspaceName = $cleanDatasetWorkspaceName -replace "[^a-zA-Z0-9\(\)&,.-]", " "
+    $cleanDatasetWorkspaceName = $cleanDatasetWorkspaceName.TrimStart()
+
+    # Clean up dataset name
+    $cleanDatasetName = $datasetName -replace '\[', '(' -replace '\]', ')'
+    $cleanDatasetName = $cleanDatasetName -replace "[^a-zA-Z0-9\(\)&,.-]", " "
+    $cleanDatasetName = $cleanDatasetName.TrimStart()
+
+    # Construct the argument list for the second model script run
+    $modelScriptArgs = "`"$sourceFolderPath\$cleanDatasetWorkspaceName ~ $cleanDatasetName.bim`" -S `"$Script4Path`""
+    
+    # Start the Tabular Editor process to run the second model script
+	Write-Host "**Extracting Measure Dependency Detail for $cleanDatasetWorkspaceName ~ $cleanDatasetName**"
+    Start-Process -FilePath "$TabularEditor2Path" -WorkingDirectory $baseFolderPath -Wait -NoNewWindow -ArgumentList $modelScriptArgs
+}
+
+Write-Host "Second model export and script run completed."
+
+#### Start of PowerShell Combining to Measure Dependencies Worksheet ####
+
+# Initialize an empty array to store all CSV data for Measure Dependencies
+$measureDependenciesCsvData = @()
+
+foreach ($csvFile in (Get-ChildItem -Path $folderPath -Filter *.csv)) {
+    # Include only files that end with "_MD.csv" for Measure Dependencies
+    if ($csvFile.Name -like "*_MD.csv") {
+        # Import the CSV file
+        $csvData = Import-Csv -Path $csvFile.FullName
+
+        # Append the data to the array
+        $measureDependenciesCsvData += $csvData
+    }
+}
+
+# Append data to the existing Excel file in the "Measure Dependencies" worksheet
+$measureDependenciesCsvData | Export-Excel -Path $outputExcelFile -WorksheetName "Measure Dependencies" -AutoNameRange -Append
+
+Write-Host "CSV files combined into the 'Measure Dependencies' worksheet in $outputExcelFile"
+
+Write-Output "Measure Dependency Detail Extraction Process Completed. Excel output saved to $outputExcelFile"
+
+
+
+
+
+
+
+#### Start of Power BI Dataflow Backup and Detail Extract ####
+
+# Function to download and extract Fabric (Gen2) dataflows
+function Export-FabricDataflow {
+    param (
+        [string]$WorkspaceId,
+        [string]$DataflowId,
+        [string]$WorkspaceName,
+        [string]$DataflowName,
+        [string]$OutputPath,
+        [string]$AccessToken
+    )
+    
+    # Clean up names
+    $cleanWorkspaceName = $WorkspaceName -replace '\[', '(' -replace '\]', ')'
+    $cleanWorkspaceName = $cleanWorkspaceName -replace "[^a-zA-Z0-9\(\)&,.-]", " "
+    $cleanWorkspaceName = $cleanWorkspaceName.TrimStart()
+    
+    $cleanDataflowName = $DataflowName -replace '\[', '(' -replace '\]', ')'
+    $cleanDataflowName = $cleanDataflowName -replace "[^a-zA-Z0-9\(\)&,.-]", " "
+    $cleanDataflowName = $cleanDataflowName.TrimStart()
+    
+    $fabricApiBaseUri = "$($global:PowerBIEndpoints.FabricApiPrefix)/v1/workspaces"
+    $endpoint = "$fabricApiBaseUri/$WorkspaceId/dataflows/$DataflowId/getDefinition"
+    
+    $headers = @{
+        "Authorization" = "Bearer $AccessToken"
+        "Content-Type"  = "application/json"
+    }
+    
+    try {
+        $response = Invoke-RestMethod -Uri $endpoint -Method POST -Headers $headers -Body "{}"
+        
+        if (-not $response.definition.parts) {
+            return $null
+        }
+        
+        # Create temp directory for extraction
+        $tempDir = Join-Path $env:TEMP "FabricDataflow_$DataflowId"
+        if (Test-Path $tempDir) {
+            Remove-Item -Path $tempDir -Recurse -Force
+        }
+        New-Item -Path $tempDir -ItemType Directory -Force | Out-Null
+        
+        # Extract files
+        foreach ($part in $response.definition.parts) {
+            $fileName = $part.path
+            $filePath = Join-Path $tempDir $fileName
+            $payloadType = $part.payloadType
+            $payload = $part.payload
+            
+            if ($payloadType -eq "InlineBase64") {
+                $bytes = [System.Convert]::FromBase64String($payload)
+                $fileDir = Split-Path $filePath
+                if (-not (Test-Path $fileDir)) {
+                    New-Item -ItemType Directory -Path $fileDir -Force | Out-Null
+                }
+                [System.IO.File]::WriteAllBytes($filePath, $bytes)
+            }
+        }
+        
+        # Find the .pq file
+        $pqFile = Get-ChildItem -Path $tempDir -Filter "*.pq" -Recurse | Select-Object -First 1
+        
+        if ($pqFile) {
+            # Read the .pq file content
+            $pqContent = Get-Content -Path $pqFile.FullName -Raw -Encoding UTF8
+            
+            # Save as .pqt
+            $outputFileName = "$cleanWorkspaceName ~ $cleanDataflowName.pq"
+            $outputFilePath = Join-Path $OutputPath $outputFileName
+            $pqContent | Out-File -FilePath $outputFilePath -Encoding UTF8
+                        
+            # Clean up temp directory
+            Remove-Item -Path $tempDir -Recurse -Force
+            
+            return @{
+                Content = $pqContent
+                FilePath = $outputFilePath
+            }
+        } else {
+            Remove-Item -Path $tempDir -Recurse -Force
+            return $null
+        }
+        
+    } catch {
+        return $null
+    }
+}
+
+# Function to parse .pq content and extract queries
+function Parse-FabricDataflowContent {
+    param (
+        [string]$Content,
+        [string]$DataflowId,
+        [string]$DataflowName,
+        [string]$WorkspaceName,
+        [datetime]$ReportDate
+    )
+    
+    $queries = @()
+    
+    # Clean up names
+    $cleanWorkspaceName = $WorkspaceName -replace '\[', '(' -replace '\]', ')'
+    $cleanWorkspaceName = $cleanWorkspaceName -replace "[^a-zA-Z0-9\(\)&,.-]", " "
+    $cleanWorkspaceName = $cleanWorkspaceName.TrimStart()
+    
+    $cleanDataflowName = $DataflowName -replace '\[', '(' -replace '\]', ')'
+    $cleanDataflowName = $cleanDataflowName -replace "[^a-zA-Z0-9\(\)&,.-]", " "
+    $cleanDataflowName = $cleanDataflowName.TrimStart()
+    
+    # Split content by "section Section1;" to get the queries section
+    $sections = $Content -split 'section Section1;', 2
+    
+    if ($sections.Count -gt 1) {
+        $queriesSection = $sections[1]
+        
+        # Use regex to find all queries:
+        # Supports both shared QueryName = ... and shared #"Query Name With Spaces" = ...
+        $pattern = '(?s)(?:\[[^\]]*\]\s*)?shared\s+(?:#"(.*?)"|([A-Za-z_]\w*))\s*=\s*(.*?)(?=(?:\[[^\]]*\]\s*)?shared\s+(?:#"(?:.*?)"|[A-Za-z_]\w*)\s*=|$)'
+        $matches = [regex]::Matches($queriesSection, $pattern)
+        
+        foreach ($match in $matches) {
+            # Group 1 = hash-quoted name, Group 2 = unquoted name, Group 3 = expression
+            if ($match.Groups[1].Success) {
+                $queryName = $match.Groups[1].Value
+            } else {
+                $queryName = $match.Groups[2].Value
+            }
+            $queryExpression = $match.Groups[3].Value.Trim()
+
+            # Remove trailing semicolons
+            $queryExpression = $queryExpression -replace ';\s*$', ''
+            $queryExpression = $queryExpression.Trim()
+
+            # Skip if empty or just whitespace
+            if ([string]::IsNullOrWhiteSpace($queryName) -or [string]::IsNullOrWhiteSpace($queryExpression)) {
+                continue
+            }
+
+            $queries += [PSCustomObject]@{
+                "Dataflow ID" = $DataflowId
+                "Dataflow Name" = $DataflowName
+                "Query Name" = $queryName
+                "Query" = $queryExpression
+                "Report Date" = $ReportDate
+                "Workspace Name - Dataflow Name" = "$cleanWorkspaceName ~ $cleanDataflowName"
+            }
+        }
+    }
+    
+    return $queries
+}
+
+
+
+
+
+
+Write-Output "Dataflow Backup and Detail Extraction Process Started"
+
+# Define the dataflow backups path
+$dataflowBackupsPath = Join-Path -Path $baseFolderPath -ChildPath "Dataflow Backups"
+
+# Check if the "Dataflow Backups" folder exists, if not create it
+if (-not (Test-Path -Path $dataflowBackupsPath)) {
+    New-Item -Path $dataflowBackupsPath -ItemType Directory -Force | Out-Null
+}
+
+# Create a variable for end of week (Friday) date
+$date = (Get-Date -UFormat "%Y-%m-%d")
+
+# Create a new folder for the backups (clear if it already exists)
+$dataflow_new_date_folder = Join-Path -Path $dataflowBackupsPath -ChildPath $date
+if (Test-Path -Path $dataflow_new_date_folder) {
+    Write-Host "[INFO] Clearing existing dataflow backup folder for today: $dataflow_new_date_folder"
+    Remove-Item -Path $dataflow_new_date_folder -Recurse -Force -ErrorAction SilentlyContinue
+}
+New-Item -Path $dataflow_new_date_folder -ItemType Directory -Force | Out-Null
+
+# Set the base output file path
+$baseOutputFilePath = $dataflow_new_date_folder
+
+# Get the latest folder by date
+$latestDataflowDateFolder = Get-ChildItem -Path $dataflowBackupsPath -Directory |
+    Where-Object { $_.Name -match '^\d{4}-\d{2}-\d{2}$' } |  # Filter for folders with a date pattern
+    Sort-Object { [datetime]::Parse($_.Name) } -Descending | # Sort by date, descending
+    Select-Object -First 1
+
+if ($latestDataflowDateFolder) {
+    # Override $baseOutputFilePath with the latest-dated folder
+    $folderPath = $latestDataflowDateFolder.FullName
+    Write-Host "Using the latest dated folder: $baseOutputFilePath"
+} else {
+    # Throw an error if no valid dated folders are found
+    Write-Error "No valid dated folders found in 'Dataflow Backups'."
+    exit
+}
+
+# Set the combined Excel output path
+$combinedExcelOutputPath = Join-Path -Path $dataflow_new_date_folder -ChildPath "Dataflow Detail.xlsx"
+
+# Define the headers
+$headers = @("Dataflow ID", "Dataflow Name", "Query Name", "Query", "Report Date", "Workspace Name - Dataflow Name")
+
+# Initialize a combined DataTable with the specified headers
+$combinedDataTable = New-Object System.Data.DataTable
+foreach ($header in $headers) {
+   $null = $combinedDataTable.Columns.Add($header, [System.String])
+}
+
+# Get the current date
+$currentDate = [datetime]::Parse($latestDataflowDateFolder.Name)
+
+
+# Loop through all workspaces to fetch Gen1 dataflows (Power BI API)
+
+
+foreach ($workspace in $workspacesInfo) {
+    $workspaceName = $workspace.WorkspaceName
+    $workspaceId = $workspace.WorkspaceId
+
+    # Set the Power BI REST API URL for the dataflow details
+    $dataflowDetailsUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups/$workspaceId/dataflows"
+
+    # Get the list of dataflows in the workspace
+    $dataflowsResponse = Invoke-PowerBIRestMethod -Url $dataflowDetailsUrl -Method Get
+
+    # Parse the JSON response
+    $dataflows = $dataflowsResponse | ConvertFrom-Json
+
+    # Check if the response is valid and contains dataflows
+    if ($dataflows -and $dataflows.value) {
+        
+        # Iterate through the Gen1 dataflows
+        foreach ($dataflow in $dataflows.value) {
+            $dataflowId = $dataflow.objectId
+            $dataflowName = $dataflow.name
+
+            # Clean up workspace name
+            $cleanWorkspaceName = $workspaceName -replace '\[', '(' -replace '\]', ')'
+            $cleanWorkspaceName = $cleanWorkspaceName -replace "[^a-zA-Z0-9\(\)&,.-]", " "
+            $cleanWorkspaceName = $cleanWorkspaceName.TrimStart()
+
+            # Clean up dataflow name
+            $cleanDataFlowName = $dataflowName -replace '\[', '(' -replace '\]', ')'
+            $cleanDataFlowName = $cleanDataFlowName -replace "[^a-zA-Z0-9\(\)&,.-]", " "
+            $cleanDataFlowName = $cleanDataFlowName.TrimStart()
+            
+            # Define output file path specific to the dataflow (Gen1)
+            $dataflowOutputFilePath = Join-Path -Path $baseOutputFilePath -ChildPath "$cleanWorkspaceName ~ $cleanDataFlowName.txt"
+            
+            # Set the Power BI REST API URL for the specific dataflow
+            $apiUrl = "$($global:PowerBIEndpoints.ApiPrefix)/v1.0/myorg/groups/$workspaceId/dataflows/$dataflowId"
+            
+            # Get the dataflow
+            $response = Invoke-PowerBIRestMethod -Url $apiUrl -Method Get
+            
+            # Save the original response to text file for backup
+            $response | Out-File -FilePath $dataflowOutputFilePath -Encoding UTF8
+            
+            # Parse the JSON response to extract document content
+            try {
+                $dataflowJson = $response | ConvertFrom-Json
+                
+                # Check if the JSON has the expected structure
+                if (-not $dataflowJson.'pbi:mashup' -or -not $dataflowJson.'pbi:mashup'.document) {
+                    continue
+                }
+                
+                # Extract the document content (Power Query code)
+                $documentContent = $dataflowJson.'pbi:mashup'.document
+                
+                # The document contains escaped content - unescape it
+                # Replace escaped newlines and quotes
+                $documentContent = $documentContent -replace '\\r\\n', "`n" -replace '\\n', "`n"
+                $documentContent = $documentContent -replace '\\"', '"'
+                
+                # Split by "section Section1;" to get the queries section
+                $sections = $documentContent -split 'section Section1;', 2
+                
+                if ($sections.Count -lt 2) {
+                    continue
+                }
+                
+                $queriesSection = $sections[1]
+                
+                # Use regex to extract queries (similar to Gen2 parsing for consistency)
+                # Supports both shared QueryName = ... and shared #"Query Name With Spaces" = ...
+                $queryPattern = '(?s)(?:\[[^\]]*\]\s*)?shared\s+(?:#"(.*?)"|([A-Za-z_]\w*))\s*=\s*(.*?)(?=(?:\[[^\]]*\]\s*)?shared\s+(?:#"(?:.*?)"|[A-Za-z_]\w*)\s*=|$)'
+                $queryMatches = [regex]::Matches($queriesSection, $queryPattern)
+                
+                $data = @()
+                foreach ($match in $queryMatches) {
+                    # Group 1 = hash-quoted name, Group 2 = unquoted name, Group 3 = expression
+                    if ($match.Groups[1].Success) {
+                        $queryName = $match.Groups[1].Value
+                    } else {
+                        $queryName = $match.Groups[2].Value
+                    }
+                    $queryExpression = $match.Groups[3].Value.Trim()
+                    
+                    # Remove trailing semicolon if present
+                    $queryExpression = $queryExpression -replace ';\s*$', ''
+                    $queryExpression = $queryExpression.Trim()
+                    
+                    if ([string]::IsNullOrWhiteSpace($queryName) -or [string]::IsNullOrWhiteSpace($queryExpression)) {
+                        continue
+                    }
+                    
+                    $data += [PSCustomObject]@{
+                        "Dataflow ID" = $dataflowId
+                        "Dataflow Name" = $dataflowName
+                        "Query Name" = $queryName
+                        "Query" = $queryExpression
+                        "Report Date" = $currentDate
+                        "Workspace Name - Dataflow Name" = "$cleanWorkspaceName ~ $cleanDataFlowName"
+                    }
+                }
+                
+                # Fill the combined DataTable with data
+                foreach ($item in $data) {
+                    $row = $combinedDataTable.NewRow()
+                    $row["Dataflow ID"] = $item."Dataflow ID"
+                    $row["Dataflow Name"] = $item."Dataflow Name"
+                    $row["Query Name"] = $item."Query Name"
+                    $row["Query"] = $item.Query
+                    $row["Report Date" ] = $item."Report Date"
+                    $row["Workspace Name - Dataflow Name"] = $item."Workspace Name - Dataflow Name"
+                    $combinedDataTable.Rows.Add($row)
+                }
+                
+            } catch {
+                continue
+            }
+        }
+    } else {
+    }
+}
+
+
+# Loop through all workspaces to fetch Gen2 dataflows (Fabric Items API)
+foreach ($workspace in $workspacesInfo) {
+    $workspaceName = $workspace.WorkspaceName
+    $workspaceId = $workspace.WorkspaceId
+    
+    # Set the Fabric API URL for items
+    $fabricItemsUrl = "$($global:PowerBIEndpoints.FabricApiPrefix)/v1/workspaces/$workspaceId/items"
+    
+    try {
+        # Get the list of items in the workspace
+        $fabricItemsResponse = Invoke-PowerBIRestMethod -Method GET -Url $fabricItemsUrl | ConvertFrom-Json
+        
+        # Filter for Dataflow items (Gen2 dataflows)
+        $gen2Dataflows = $fabricItemsResponse.value | Where-Object { $_.type -eq 'Dataflow' }
+        
+        if ($gen2Dataflows -and $gen2Dataflows.Count -gt 0) {
+            
+            # Iterate through the Gen2 dataflows
+            foreach ($dataflow in $gen2Dataflows) {
+                $dataflowId = $dataflow.id
+                $dataflowName = $dataflow.displayName
+                
+                
+                # Get current access token
+                $currentAccessToken = Get-CurrentAccessToken
+                
+                # Download and extract Fabric dataflow
+                $fabricResult = Export-FabricDataflow -WorkspaceId $workspaceId `
+                                                      -DataflowId $dataflowId `
+                                                      -WorkspaceName $workspaceName `
+                                                      -DataflowName $dataflowName `
+                                                      -OutputPath $baseOutputFilePath `
+                                                      -AccessToken $currentAccessToken
+                
+                if ($fabricResult) {
+                    # Parse the .pq content
+                    $parsedQueries = Parse-FabricDataflowContent -Content $fabricResult.Content `
+                                                                  -DataflowId $dataflowId `
+                                                                  -DataflowName $dataflowName `
+                                                                  -WorkspaceName $workspaceName `
+                                                                  -ReportDate $currentDate
+                    
+                    # Add parsed queries to combined DataTable
+                    foreach ($query in $parsedQueries) {
+                        $row = $combinedDataTable.NewRow()
+                        $row["Dataflow ID"] = $query."Dataflow ID"
+                        $row["Dataflow Name"] = $query."Dataflow Name"
+                        $row["Query Name"] = $query."Query Name"
+                        $row["Query"] = $query.Query
+                        $row["Report Date"] = $query."Report Date"
+                        $row["Workspace Name - Dataflow Name"] = $query."Workspace Name - Dataflow Name"
+                        $combinedDataTable.Rows.Add($row)
+                    }
+                }
+            }
+        } else {
+        }
+    } catch {
+    }
+}
+
+# Check if the combined DataTable has any rows, if not add a dummy row with headers only
+if ($combinedDataTable.Rows.Count -eq 0) {
+    $row = $combinedDataTable.NewRow()
+    foreach ($header in $headers) {
+        $row[$header] = ""
+    }
+    $combinedDataTable.Rows.Add($row)
+}
+
+
+
+# Export the combined DataTable to an Excel file
+$combinedDataTable | Export-Excel -Path $combinedExcelOutputPath -AutoSize
+Write-Host "Data exported to $combinedExcelOutputPath"
+
+# Copy the Excel file to the base folder for easy access
+$fileName = "Dataflow Detail.xlsx"
+$sourceFilePath = Join-Path -Path $dataflow_new_date_folder -ChildPath $fileName
+$destinationFilePath = Join-Path -Path $baseFolderPath -ChildPath $fileName
+
+# Check if the source file exists
+if (Test-Path -Path $sourceFilePath) {
+    # Remove the destination file if it already exists
+    if (Test-Path -Path $destinationFilePath) {
+        Remove-Item -Path $destinationFilePath -Force
+    }
+    
+    # Copy the source file to the destination
+    Copy-Item -Path $sourceFilePath -Destination $destinationFilePath
+} else {
+    Write-Warning "Source file not found: $sourceFilePath"
+}
+
+Write-Output "Dataflow Backup and Detail Extraction Process Completed. Excel output saved to $combinedExcelOutputPath"
+
+
+# Stop the background job after script completion
+Stop-Job -Name "TokenRefreshJob"
+Remove-Job -Name "TokenRefreshJob"
+
+if (Test-Path -Path $global:TokenFilePath) {
+    Remove-Item -Path $global:TokenFilePath -Force
+}
+
+Write-Output "All Excel files processed and combined successfully."
+
+$scriptEndTime = Get-Date
+$elapsedTime = New-TimeSpan -Start $scriptStartTime -End $scriptEndTime
+Write-Output "Total Elapsed Time: $($elapsedTime.Hours)h $($elapsedTime.Minutes)m $($elapsedTime.Seconds)s"
+ 
