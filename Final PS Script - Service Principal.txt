@@ -918,9 +918,9 @@ function Show-WorkspacePicker {
     })
     $form.Controls.Add($cancelBtn)
 
-    # Timer (auto-close after 10 minutes)
+    # Timer (auto-close after 2 minutes)
     $timer = New-Object System.Windows.Forms.Timer
-    $timer.Interval = 600000
+    $timer.Interval = 120000
     $timer.Add_Tick({
         $timer.Stop()
         $form.Tag = 'Timeout'
