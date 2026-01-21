@@ -78,7 +78,8 @@ Before running this Service Principal version, you need to:
 > Make a folder at:  `C:\Power BI Backups`  
 
 #### ✅ Step 2: Add Files  
-> Download all repo files and place them into the newly-created `C:\Power BI Backups` folder.  
+> - Download the repo files and place them into the newly-created `C:\Power BI Backups` folder.
+> - Direct link to the packaged zip download: https://github.com/BeSmarterWithData/ImpactIQ-ServicePrincipal/archive/refs/heads/main.zip
 
 #### ✅ Step 3: Configure Service Principal Credentials
 > Open `Final PS Script - Service Principal.txt` in a text editor and update the three credential values at the top:
