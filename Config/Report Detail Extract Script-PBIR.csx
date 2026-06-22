@@ -1,4 +1,5 @@
 #r "System.IO"
+#r "System.IO.Compression"
 #r "System.IO.Compression.FileSystem"
 
 using System.IO;
@@ -284,10 +285,22 @@ foreach (var rpt in fileList)
     try
     {
         File.Copy(rpt, zipPath, true);
-        ZipFile.ExtractToDirectory(zipPath, unzipPath);
+        using (var archive = ZipFile.OpenRead(zipPath))
+        {
+            foreach (var entry in archive.Entries)
+            {
+                try
+                {
+                    string destPath = Path.Combine(unzipPath, entry.FullName);
+                    string destDir = Path.GetDirectoryName(destPath);
+                    if (!Directory.Exists(destDir)) Directory.CreateDirectory(destDir);
+                    if (!string.IsNullOrEmpty(entry.Name))
+                        entry.ExtractToFile(destPath, true);
+                }
+                catch { /* skip entries that fail (long path, etc.) */ }
+            }
+        }
         extractionSucceeded = true;
-        if (extractionSucceeded && Directory.Exists(unzipPath))
-            foldersToDelete.Add(unzipPath);
     }
     catch { }
     finally
@@ -1159,12 +1172,28 @@ if (Directory.Exists(definitionRoot)) // <-- gate on PBIR structure
                     }
                     catch { }
 
-                    // === Get title text ===
+                    // === Get title text / visual name ===
                     try
                     {
-                        var general = node.SelectToken("visual.objects.general[0].properties.paragraphs[0].textRuns[0].value");
-                        if (general != null) name = general.ToString();
-                        
+                        // 1. Title text set on the visual container (most common in PBIR)
+                        var titleLiteral = node.SelectToken("visual.visualContainerObjects.title[0].properties.text.expr.Literal.Value");
+                        if (titleLiteral != null) name = titleLiteral.ToString().Trim('\'', '"');
+
+                        // 2. Visual group display name
+                        if (string.IsNullOrEmpty(name))
+                        {
+                            var groupName = node.SelectToken("visualGroup.displayName") ?? node.SelectToken("visual.visualGroup.displayName");
+                            if (groupName != null) name = groupName.ToString();
+                        }
+
+                        // 3. Text box content
+                        if (string.IsNullOrEmpty(name))
+                        {
+                            var general = node.SelectToken("visual.objects.general[0].properties.paragraphs[0].textRuns[0].value");
+                            if (general != null) name = general.ToString();
+                        }
+
+                        // 4. Other legacy/alternate title paths
                         if (string.IsNullOrEmpty(name))
                         {
                             var altTitlePaths = new[] {
@@ -1185,6 +1214,12 @@ if (Directory.Exists(definitionRoot)) // <-- gate on PBIR structure
                         }
                     }
                     catch { }
+
+                    // 5. Fall back to the visual type when no name/title is present
+                    if (string.IsNullOrEmpty(name))
+                    {
+                        name = visualType;
+                    }
 
                     // === Get position ===
                     try
