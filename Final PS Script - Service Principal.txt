@@ -1874,9 +1874,187 @@ function Export-ReportUsingAPI {
             -Headers @{ Authorization = "Bearer $accessToken" } `
             -Method GET `
             -OutFile $OutFilePath
+        # Treat as success only if a non-empty file was actually written
+        if ((Test-Path $OutFilePath) -and ((Get-Item $OutFilePath).Length -gt 0)) {
+            return $true
+        }
+        return $false
     } catch {
-        
+        return $false
     }
+}
+
+# Function to Export a Report's PBIR Definition via the Fabric Definition API,
+# then zip the returned parts and rename the archive to .pbix.
+# NOTE: A zipped PBIR definition renamed to .pbix is NOT an openable Power BI
+# Desktop file by design - it is produced this way intentionally.
+# Used ONLY as a fallback when the standard LiveConnect export fails.
+# Written for Windows PowerShell 5.1 compatibility.
+function Export-ReportDefinitionAsPbix {
+    param (
+        [string]$WorkspaceId,
+        [string]$ReportId,
+        [string]$OutFilePath
+    )
+
+    Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+
+    $accessToken = Get-CurrentAccessToken
+    $headers = @{ Authorization = "Bearer $accessToken"; 'Content-Type' = 'application/json' }
+    $defUrl  = "$($global:PowerBIEndpoints.FabricApiPrefix)/v1/workspaces/$WorkspaceId/reports/$ReportId/getDefinition"
+
+    try {
+        $resp = Invoke-WebRequest -Uri $defUrl -Method POST -Headers $headers -Body '{}' -UseBasicParsing -ErrorAction Stop
+    } catch {
+        Write-Warning "getDefinition failed for report $ReportId : $($_.Exception.Message)"
+        return $false
+    }
+
+    $definition = $null
+    $statusCode = [int]$resp.StatusCode
+
+    if ($statusCode -eq 200) {
+        $definition = $resp.Content | ConvertFrom-Json
+    }
+    elseif ($statusCode -eq 202) {
+        # Long-running operation: poll the operation until it completes, then fetch the result
+        $opUrl = $resp.Headers['Location']
+        if ($opUrl -is [array]) { $opUrl = $opUrl[0] }
+        $retry = 2
+        if ($resp.Headers['Retry-After']) { $retry = [int]($resp.Headers['Retry-After'] | Select-Object -First 1) }
+
+        while ($true) {
+            Start-Sleep -Seconds $retry
+            try {
+                $op = Invoke-WebRequest -Uri $opUrl -Method GET -Headers $headers -UseBasicParsing -ErrorAction Stop
+            } catch {
+                Write-Warning "Polling definition op failed for report $ReportId : $($_.Exception.Message)"
+                return $false
+            }
+            $status = ($op.Content | ConvertFrom-Json).status
+            if ($status -eq 'Succeeded') { break }
+            if ($status -eq 'Failed')    { Write-Warning "Definition operation failed for report $ReportId"; return $false }
+            if ($op.Headers['Retry-After']) { $retry = [int]($op.Headers['Retry-After'] | Select-Object -First 1) }
+        }
+
+        $resultUrl = ($opUrl.TrimEnd('/')) + '/result'
+        try {
+            $result = Invoke-WebRequest -Uri $resultUrl -Method GET -Headers $headers -UseBasicParsing -ErrorAction Stop
+        } catch {
+            Write-Warning "Fetching definition result failed for report $ReportId : $($_.Exception.Message)"
+            return $false
+        }
+        $definition = $result.Content | ConvertFrom-Json
+    }
+    else {
+        Write-Warning "Unexpected status $statusCode from getDefinition for report $ReportId"
+        return $false
+    }
+
+    if (-not $definition.definition.parts) {
+        Write-Warning "No definition parts returned for report $ReportId"
+        return $false
+    }
+
+    # Stage the parts into a temp folder.
+    # NOTE: getDefinition returns part paths WITHOUT a "Report/" prefix
+    # (e.g. "definition/report.json"), but the PBIX/PBIR layout expected by the
+    # Report Detail extractor is "Report/definition/...". Nest everything under
+    # a "Report" folder so the zipped .pbix matches that structure.
+    $stageDir = Join-Path $env:TEMP ("ReportDef_" + $ReportId)
+    if (Test-Path $stageDir) { Remove-Item $stageDir -Recurse -Force }
+    New-Item -ItemType Directory -Path $stageDir -Force | Out-Null
+    $reportRoot = Join-Path $stageDir 'Report'
+    New-Item -ItemType Directory -Path $reportRoot -Force | Out-Null
+
+    foreach ($part in $definition.definition.parts) {
+        $partPath = Join-Path $reportRoot $part.path
+        $partDir  = Split-Path $partPath -Parent
+        if (-not (Test-Path $partDir)) { New-Item -ItemType Directory -Path $partDir -Force | Out-Null }
+        if ($part.payloadType -eq 'InlineBase64') {
+            [System.IO.File]::WriteAllBytes($partPath, [System.Convert]::FromBase64String($part.payload))
+        } else {
+            [System.IO.File]::WriteAllText($partPath, [string]$part.payload)
+        }
+    }
+
+    # If getDefinition returned the legacy (non-PBIR) layout, there is NO
+    # "definition" folder - instead a root-level "report.json" carries the
+    # report layout. Rename it to "Layout" (no extension) AND re-encode it as
+    # UTF-16 LE (no BOM) to match the classic PBIX layout the downstream
+    # extractor expects. getDefinition returns report.json as UTF-8, but a real
+    # PBIX "Report/Layout" is UTF-16 LE; without this conversion the parser
+    # reads garbage and fails.
+    $defFolder = Join-Path $reportRoot 'definition'
+    if (-not (Test-Path $defFolder)) {
+        $reportJson = Join-Path $reportRoot 'report.json'
+        if (Test-Path $reportJson) {
+            $layoutPath = Join-Path $reportRoot 'Layout'
+            if (Test-Path $layoutPath) { Remove-Item $layoutPath -Force }
+            $layoutText = [System.IO.File]::ReadAllText($reportJson, [System.Text.Encoding]::UTF8)
+            $utf16NoBom = New-Object System.Text.UnicodeEncoding($false, $false)  # LE, no BOM
+            [System.IO.File]::WriteAllText($layoutPath, $layoutText, $utf16NoBom)
+            Remove-Item $reportJson -Force
+        }
+    }
+
+    # getDefinition does NOT return a "Connections" file, but the downstream
+    # Report Detail extractor expects one at the ROOT (alongside the "Report"
+    # folder) to populate the Connections sheet + ModelID/ReportID. Synthesize
+    # it from definition.pbir's datasetReference so the layout matches a PBIX.
+    $pbirPath = Join-Path $reportRoot 'definition.pbir'
+    if (Test-Path $pbirPath) {
+        try {
+            $pbir  = Get-Content -Path $pbirPath -Raw | ConvertFrom-Json
+            $dsRef = $pbir.datasetReference
+            $connString = $null
+            $datasetId  = ''
+
+            if ($dsRef.byConnection -and $dsRef.byConnection.connectionString) {
+                $connString = $dsRef.byConnection.connectionString
+                $m = [regex]::Match($connString, 'semanticmodelid=([0-9a-fA-F-]+)')
+                if ($m.Success) { $datasetId = $m.Groups[1].Value }
+            }
+            elseif ($dsRef.byPath -and $dsRef.byPath.path) {
+                $connString = 'byPath:' + $dsRef.byPath.path
+            }
+
+            if ($connString) {
+                $connObj = [pscustomobject]@{
+                    Version     = '3.0'
+                    Connections = @(
+                        [pscustomobject]@{
+                            Name             = 'EntityDataSource'
+                            ConnectionString = $connString
+                            ConnectionType   = 'pbiServiceLive'
+                        }
+                    )
+                    RemoteArtifacts = @(
+                        [pscustomobject]@{
+                            DatasetId = $datasetId
+                            ReportId  = $ReportId
+                        }
+                    )
+                }
+                # Root-level file literally named "Connections" (no extension) to match PBIX
+                $connJson = $connObj | ConvertTo-Json -Depth 6 -Compress
+                [System.IO.File]::WriteAllText((Join-Path $stageDir 'Connections'), $connJson)
+            }
+        } catch {
+            Write-Warning "Could not synthesize Connections file for report $ReportId : $($_.Exception.Message)"
+        }
+    }
+
+    # Zip the staged folder, then rename the archive to .pbix
+    if (Test-Path $OutFilePath) { Remove-Item $OutFilePath -Force }
+    $tempZip = Join-Path $env:TEMP ("ReportDef_" + $ReportId + ".zip")
+    if (Test-Path $tempZip) { Remove-Item $tempZip -Force }
+
+    [System.IO.Compression.ZipFile]::CreateFromDirectory($stageDir, $tempZip)
+    Move-Item -Path $tempZip -Destination $OutFilePath -Force
+
+    Remove-Item $stageDir -Recurse -Force -ErrorAction SilentlyContinue
+    return $true
 }
 
 	# -------------------
@@ -1928,11 +2106,23 @@ function Export-ReportUsingAPI {
 	
 	        # Export based on Workspace Type
 	        if ($workspace.WorkspaceIsOnDedicatedCapacity -eq $false) {
-	            # Pro Workspace → IncludeModel
-	            Export-ReportUsingAPI -GroupId $workspaceId -ReportId $reportId -OutFilePath $filepath -DownloadType "IncludeModel"
+	            # Pro Workspace → IncludeModel (real .pbix, used for model extraction below)
+	            $null = Export-ReportUsingAPI -GroupId $workspaceId -ReportId $reportId -OutFilePath $filepath -DownloadType "IncludeModel"
+	        } elseif ($fileExtension -eq 'pbix') {
+	            # Non-Pro PBIX report (Premium / Fabric / etc.) → LiveConnect by default.
+	            # Only if LiveConnect fails do we fall back to the getDefinition export
+	            # (a zipped PBIR definition renamed to .pbix - intentional).
+	            $liveExported = Export-ReportUsingAPI -GroupId $workspaceId -ReportId $reportId -OutFilePath $filepath -DownloadType "LiveConnect"
+	            if (-not $liveExported) {
+	                Write-Warning "LiveConnect export failed for $cleanWorkspaceName ~ $cleanReportName; falling back to getDefinition."
+	                $defExported = Export-ReportDefinitionAsPbix -WorkspaceId $workspaceId -ReportId $reportId -OutFilePath $filepath
+	                if (-not $defExported) {
+	                    Write-Warning "getDefinition export also failed for $cleanWorkspaceName ~ $cleanReportName."
+	                }
+	            }
 	        } else {
-	            # Premium/Fabric Workspace → LiveConnect
-	            Export-ReportUsingAPI -GroupId $workspaceId -ReportId $reportId -OutFilePath $filepath -DownloadType "LiveConnect"
+	            # Non-Pro paginated (RDL) report → LiveConnect export
+	            $null = Export-ReportUsingAPI -GroupId $workspaceId -ReportId $reportId -OutFilePath $filepath -DownloadType "LiveConnect"
 	        }
 			
 		# Only process model extraction for Pro Workspaces
